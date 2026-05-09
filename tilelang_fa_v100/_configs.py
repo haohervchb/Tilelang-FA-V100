@@ -65,8 +65,6 @@ def get_paged_configs(*args, **kwargs):
     block_N_vals = [32, 64, 128, 256]
     if dim <= 32:
         block_N_vals.extend([512])
-    if dim >= 128:
-        block_N_vals.extend([48])
     for block_M in block_M_vals:
         for block_N in block_N_vals:
             if _smem_forward(block_M, block_N, dim) > MAX_SMEM:

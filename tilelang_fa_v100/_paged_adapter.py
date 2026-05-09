@@ -5,9 +5,23 @@ When block_size < block_N, copies pages into a contiguous super-page buffer.
 When block_size >= block_N, passes through directly (zero-copy).
 """
 import math
+import warnings
 import torch
 
-from ._kernels_paged import tilelang_paged_kernel
+import tilelang
+
+from ._kernels_paged import _paged_kernel_func
+
+# Suppress TVM FFI noisy warnings on worker imports
+warnings.filterwarnings("ignore", message="Field.*duplicates an ancestor field")
+warnings.filterwarnings("ignore", message=".*GemmSPWarpPolicy.*")
+
+# Best-known SM70 configs for the paged kernel (pre-tuned)
+_BEST_CONFIGS = {
+    64: dict(block_M=32, block_N=128, threads=256, num_stages=0),
+    128: dict(block_M=32, block_N=128, threads=256, num_stages=0),
+    256: dict(block_M=16, block_N=64, threads=128, num_stages=0),
+}
 
 # Reusable staging buffers (lazily allocated, cached across calls)
 _staging_k = None
@@ -108,8 +122,9 @@ def paged_forward(q, k_cache, v_cache, block_table, seq_lens,
     # Compute total pages and padded size
     num_staging_pages_total = k_linear.shape[0] // page_bs if page_bs > 0 else 1
 
-    # Call TileLang paged kernel
-    kernel_compiled = tilelang_paged_kernel(
+    # Compile paged kernel with best-known SM70 config (no autotune in production)
+    cfg = _BEST_CONFIGS.get(D, dict(block_M=32, block_N=128, threads=256, num_stages=0))
+    kernel_compiled = tilelang.jit(out_idx=[5])(_paged_kernel_func).compile(
         batch=B, heads=num_heads, heads_kv=heads_kv, dim=D,
         page_block_size=page_bs,
         max_blocks_per_seq=num_staged_pages,
@@ -117,6 +132,7 @@ def paged_forward(q, k_cache, v_cache, block_table, seq_lens,
         num_tokens=num_tokens,
         tokens_per_seq=tokens_per_seq,
         is_causal=causal,
+        **cfg,
     )
 
     result = kernel_compiled(q, k_linear, v_linear, bt_2d, seq_lens)
