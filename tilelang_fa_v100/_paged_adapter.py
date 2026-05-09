@@ -99,8 +99,11 @@ def paged_forward(q, k_cache, v_cache, block_table, seq_lens,
 
         k_linear = _staging_k
         v_linear = _staging_v
-        bt_2d = block_table * block_size
-        num_staged_pages = block_table.shape[1]
+        # Rebuild block_table for super-pages (each covering page_bs tokens)
+        super_pages_per_seq = super_pages_needed // B
+        bt_new = torch.arange(super_pages_needed, dtype=torch.int32, device=k_cache.device).view(B, super_pages_per_seq) * page_bs
+        bt_2d = bt_new
+        num_staged_pages = super_pages_per_seq
 
     # Compute total pages and padded size
     num_staging_pages_total = k_linear.shape[0] // page_bs if page_bs > 0 else 1
