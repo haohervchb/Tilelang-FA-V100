@@ -71,19 +71,17 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                     for i, j in T.Parallel(block_M, block_N):
                         q_pos = bx * block_M + i
                         kv_pos = k * block_N + j
+                        causal_ok = kv_pos <= q_pos + kv_offset
+                        seq_ok = kv_pos < cache_seqlens[bz]
                         acc_s[i, j] = T.if_then_else(
-                            kv_pos <= q_pos + kv_offset,
-                            0, -T.infinity(acc_s.dtype)
+                            causal_ok & seq_ok, 0, -T.infinity(acc_s.dtype)
                         )
                 else:
-                    T.clear(acc_s)
-                # Mask positions beyond valid KV cache length
-                for i, j in T.Parallel(block_M, block_N):
-                    acc_s[i, j] = T.if_then_else(
-                        k * block_N + j >= cache_seqlens[bz],
-                        -T.infinity(acc_s.dtype),
-                        acc_s[i, j]
-                    )
+                    for i, j in T.Parallel(block_M, block_N):
+                        acc_s[i, j] = T.if_then_else(
+                            k * block_N + j < cache_seqlens[bz],
+                            0, -T.infinity(acc_s.dtype)
+                        )
 
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=GemmWarpPolicy.FullRow)
                 T.copy(m_i, m_prev)
