@@ -39,5 +39,8 @@ def paged_forward(q, k_cache, v_cache, block_table, seq_lens,
     result = kernel_compiled(q, k_cache, v_cache, block_table, seq_lens,
                              num_tokens)
 
+    # Copy kernel output into the caller-provided 'out' tensor
+    out.copy_(result)
+
     softmax_lse = torch.empty(num_heads, num_tokens, dtype=torch.float32, device=q.device)
-    return result, softmax_lse
+    return out, softmax_lse
