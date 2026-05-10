@@ -1,35 +1,38 @@
-"""Paged FlashAttention forward kernel for V100 (SM70). Autotuned."""
+"""Paged FlashAttention forward kernel for V100 (SM70). Autotuned.
+Dynamic tensor dimensions — compiles ONCE per process, reused for all prompts.
+"""
 import math
 import torch
 import tilelang
 import tilelang.language as T
 from tilelang.tileop.base import GemmWarpPolicy
-from ._configs import get_paged_configs
 
 
 def _paged_kernel_func_4d(batch, heads, heads_kv, dim, page_block_size,
-                          max_blocks_per_seq, num_pages, num_tokens,
-                          tokens_per_seq, is_causal,
+                          max_blocks_per_seq, num_pages, is_causal,
                           block_M=32, block_N=128, num_stages=0, threads=256):
-    """Paged FA forward reading directly from vLLM's 4D KV cache.
+    """Paged FA forward with dynamic tensor size.
     
-    K/V layout: [num_pages, page_block_size, heads_kv, dim]
-    block_table: [batch, max_blocks_per_seq] — page indices
-    For each KV tile (block_N tokens), reads from ceil(block_N/page_block_size) pages.
+    K/V: [num_pages, page_block_size, heads_kv, dim] — 4D paged
+    Grid uses max_tokens (runtime T.int32), not compile-time value.
+    Q/Output shape is dynamic via T.dynamic("nt").
+    Cache key: (heads, heads_kv, dim, block_size, is_causal) — no num_tokens.
     """
     scale = (1.0 / dim) ** 0.5
     pages_per_tile = block_N // page_block_size
+    nt = T.dynamic("nt")
 
     @T.prim_func
     def main(
-        Q: T.Tensor([num_tokens, heads, dim], T.float16),
+        Q: T.Tensor([nt, heads, dim], T.float16),
         K_cache: T.Tensor([num_pages, page_block_size, heads_kv, dim], T.float16),
         V_cache: T.Tensor([num_pages, page_block_size, heads_kv, dim], T.float16),
         block_table: T.Tensor([batch, max_blocks_per_seq], T.int32),
         cache_seqlens: T.Tensor([batch], T.int32),
-        Output: T.Tensor([num_tokens, heads, dim], T.float16),
+        max_tokens: T.int32,
+        Output: T.Tensor([nt, heads, dim], T.float16),
     ):
-        with T.Kernel(T.ceildiv(tokens_per_seq, block_M), heads, batch, threads=threads) as (bx, by, bz):
+        with T.Kernel(T.ceildiv(max_tokens, block_M), heads, batch, threads=threads) as (bx, by, bz):
             Q_shared = T.alloc_shared([block_M, dim], T.float16)
             K_shared = T.alloc_shared([block_N, dim], T.float16)
             V_shared = T.alloc_shared([block_N, dim], T.float16)
@@ -45,8 +48,8 @@ def _paged_kernel_func_4d(batch, heads, heads_kv, dim, page_block_size,
             row_sum = T.alloc_fragment([block_M], T.float32)
 
             kv_head = by // (heads // heads_kv)
-            start_q = bz * tokens_per_seq + bx * block_M
-            kv_offset = cache_seqlens[bz] - tokens_per_seq
+            start_q = bz * max_tokens + bx * block_M
+            kv_offset = cache_seqlens[bz] - max_tokens
 
             T.copy(Q[start_q: start_q + block_M, by, :], Q_shared)
             T.fill(acc_o, 0)
@@ -61,7 +64,6 @@ def _paged_kernel_func_4d(batch, heads, heads_kv, dim, page_block_size,
             )
 
             for k in T.Pipelined(loop_end, num_stages=num_stages):
-                # Load K tile from 4D paged cache, page by page
                 for p in T.serial(pages_per_tile):
                     logical_page = T.floordiv(k * block_N, page_block_size) + p
                     phys = block_table[bz, logical_page]
@@ -96,7 +98,6 @@ def _paged_kernel_func_4d(batch, heads, heads_kv, dim, page_block_size,
                 for i in T.Parallel(block_M):
                     l_i[i] += row_sum[i]
 
-                # Load V tile from 4D paged cache
                 for p in T.serial(pages_per_tile):
                     logical_page2 = T.floordiv(k * block_N, page_block_size) + p
                     phys2 = block_table[bz, logical_page2]
@@ -110,34 +111,43 @@ def _paged_kernel_func_4d(batch, heads, heads_kv, dim, page_block_size,
                 T.gemm(acc_s_cast, V_shared, acc_o, policy=GemmWarpPolicy.Square)
 
             for i, j in T.Parallel(block_M, dim):
-                if start_q + i < (bz + 1) * tokens_per_seq:
+                if start_q + i < nt:
                     Output[start_q + i, by, j] = T.cast(acc_o[i, j] / l_i[i], T.float16)
 
     return main
 
 
-_paged_kernel_4d = tilelang.jit(out_idx=[5])(_paged_kernel_func_4d)
+_paged_kernel_4d = tilelang.jit(out_idx=[6])(_paged_kernel_func_4d)
 
 
-def make_paged_from_dense(Q, K, V, page_block_size=16):
-    """Convert dense 4D Q/K/V to 4D paged format for testing (vLLM-compatible)."""
-    B, H, M, D = Q.shape
-    N = K.shape[2]
-    q_flat = Q.permute(0, 2, 1, 3).reshape(B * M, H, D).contiguous()
-    pages_per_seq = int(math.ceil(N / page_block_size))
-    num_pages = B * pages_per_seq
-    k_cache = torch.zeros(num_pages, page_block_size, H, D, dtype=torch.float16, device='cuda')
-    v_cache = torch.zeros(num_pages, page_block_size, H, D, dtype=torch.float16, device='cuda')
-    for i in range(B):
-        for j in range(N):
-            page = j // page_block_size
-            offset = j % page_block_size
-            k_cache[i * pages_per_seq + page, offset, :, :] = K[i, :, j, :]
-            v_cache[i * pages_per_seq + page, offset, :, :] = V[i, :, j, :]
-    block_table = torch.arange(num_pages, dtype=torch.int32, device='cuda').view(B, pages_per_seq)
-    seq_lens = torch.full((B,), N, dtype=torch.int32, device='cuda')
-    return dict(
-        Q_flat=q_flat, K_cache=k_cache, V_cache=v_cache,
-        block_table=block_table, seq_lens=seq_lens,
-        num_tokens=B * M, num_pages=num_pages, tokens_per_seq=M,
-    )
+# Cache for compiled kernels: {(heads, heads_kv, dim, block_size, causal): kernel}
+# No num_tokens/num_pages dependency — kernel is shape-agnostic.
+_KERNEL_CACHE = {}
+
+_BEST_CONFIGS = {
+    64: dict(block_M=32, block_N=128, threads=256, num_stages=0),
+    128: dict(block_M=32, block_N=128, threads=256, num_stages=0),
+    256: dict(block_M=16, block_N=64, threads=128, num_stages=0),
+}
+
+
+def get_paged_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
+                     max_blocks, causal):
+    """Return a compiled kernel, compiling once per (heads, dim, block_size, causal) combo.
+    
+    The kernel uses dynamic tensor shapes and a runtime max_tokens parameter,
+    so it works for ANY num_tokens without recompilation.
+    """
+    key = (heads, heads_kv, dim, block_size, causal)
+    if key not in _KERNEL_CACHE:
+        cfg = _BEST_CONFIGS.get(dim, dict(block_M=32, block_N=128, threads=256, num_stages=0))
+        kt = tilelang.jit(out_idx=[6])(_paged_kernel_func_4d).compile(
+            batch=batch, heads=heads, heads_kv=heads_kv, dim=dim,
+            page_block_size=block_size,
+            max_blocks_per_seq=max_blocks,
+            num_pages=num_pages,
+            is_causal=causal,
+            **cfg,
+        )
+        _KERNEL_CACHE[key] = kt
+    return _KERNEL_CACHE[key]
