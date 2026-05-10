@@ -1,7 +1,6 @@
-"""Adapter: calls TileLang paged kernel via 2D linear K/V view.
-Zero-copy reshape: k_cache.reshape(-1, heads_kv, dim) → no staging buffer.
-Block table: page indices × block_size = absolute positions.
-Kernel uses T.copy (vectorized) for each KV tile, not element-by-element.
+"""Adapter: calls TileLang paged kernel on vLLM's 4D paged K/V cache.
+Page-by-page loading handles scattered physical blocks correctly.
+Kernel uses T.Parallel for per-page element-wise load (correct for non-consecutive pages).
 """
 import math
 import warnings
@@ -26,27 +25,19 @@ def paged_forward(q, k_cache, v_cache, block_table, seq_lens,
     if out is None:
         out = torch.empty_like(q)
 
-    # Zero-copy: reshape 4D [num_blocks, block_size, heads_kv, D] to 2D
-    # [num_padded_tokens, heads_kv, D]. The view is contiguous row-major:
-    # block 0's tokens occupy positions [0, block_size), block 1 at [block_size, 2*block_size), etc.
-    k_linear = k_cache.reshape(-1, heads_kv, D)
-    v_linear = v_cache.reshape(-1, heads_kv, D)
-
-    # block_table: page indices → absolute start positions in the 2D buffer
-    # Each page has block_size tokens. Logical page p starts at position p * block_size.
-    bt_abs = block_table * block_size  # cheap GPU multiply
-
-    num_pages = k_cache.shape[0]
+    num_blocks = k_cache.shape[0]
     max_blocks = block_table.shape[1]
 
     kernel_compiled = get_paged_kernel(
         batch=B, heads=num_heads, heads_kv=heads_kv, dim=D,
-        block_size=block_size, num_pages=num_pages,
+        block_size=block_size, num_pages=num_blocks,
         max_blocks=max_blocks, causal=causal,
     )
 
-    result = kernel_compiled(q, k_linear, v_linear, bt_abs, seq_lens,
-                             num_tokens)  # T.int32 runtime param — no recompile
+    # Pass 4D cache directly + block_table as page indices
+    # Kernel loads each tile page-by-page: block_table[b, L] gives physical page
+    result = kernel_compiled(q, k_cache, v_cache, block_table, seq_lens,
+                             num_tokens)
 
     softmax_lse = torch.empty(num_heads, num_tokens, dtype=torch.float32, device=q.device)
     return result, softmax_lse
