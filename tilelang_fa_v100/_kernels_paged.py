@@ -77,10 +77,24 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                         )
                 else:
                     T.clear(acc_s)
+                # Mask positions beyond valid KV cache length
+                for i, j in T.Parallel(block_M, block_N):
+                    acc_s[i, j] = T.if_then_else(
+                        k * block_N + j >= cache_seqlens[bz],
+                        -T.infinity(acc_s.dtype),
+                        acc_s[i, j]
+                    )
 
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=GemmWarpPolicy.FullRow)
                 T.copy(m_i, m_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                # Check_inf: if all scores masked (-inf), clamp to 0 to avoid NaN in sf
+                for i in T.Parallel(block_M):
+                    m_i[i] = T.if_then_else(
+                        m_i[i] == -T.infinity(T.float32),
+                        T.cast(0, T.float32),
+                        m_i[i]
+                    )
                 for i in T.Parallel(block_M):
                     m_i[i] = T.max(m_i[i], m_prev[i])
                 for i in T.Parallel(block_M):
