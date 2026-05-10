@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from ._kernels_forward import tilelang_forward, tilelang_forward_lse, kernel_forward_lse
 from ._kernels_backward import tilelang_backward
 from ._paged_adapter import paged_forward as _paged_forward
+from ._decode_adapter import decode_forward as _decode_forward
 
 
 class FlashAttnTileLangVFunc(torch.autograd.Function):
@@ -96,3 +97,19 @@ def tilelang_paged_forward(q, k_cache, v_cache, block_table, seq_lens,
 
 
 tilelang_flash_attn_gpu = tilelang_flash_attn_func
+
+
+def tilelang_decode_forward(q, k_cache, v_cache, block_table, seq_lens,
+                            block_size=16, num_kv_heads=None,
+                            softmax_scale=None):
+    """TileLang paged decode forward for vLLM integration.
+
+    Args match the reference FA-V100 decode_fwd API.
+    Returns:
+        output: [batch, heads, dim] fp16
+    """
+    return _decode_forward(
+        q, k_cache, v_cache, block_table, seq_lens,
+        block_size=block_size, num_kv_heads=num_kv_heads,
+        softmax_scale=softmax_scale,
+    )

@@ -288,3 +288,125 @@ def get_paged_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
         )
         _KERNEL_CACHE[key] = kt
     return _KERNEL_CACHE[key]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Decode kernel (shared-memory softmax to avoid 1D fragment layout conflicts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _decode_kernel_func(batch, heads, heads_kv, dim, page_block_size,
+                        max_blocks_per_seq, num_pages,
+                        block_N=128, num_stages=0, threads=128):
+    scale = (1.0 / dim) ** 0.5
+    pts = block_N // page_block_size
+    block_M = 16  # SM70 MMA minimum; row 0 = real Q, rows 1-15 = zero padding
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor([batch, heads, dim], T.float16),
+        Kc: T.Tensor([num_pages, page_block_size, heads_kv, dim], T.float16),
+        Vc: T.Tensor([num_pages, page_block_size, heads_kv, dim], T.float16),
+        bt: T.Tensor([batch, max_blocks_per_seq], T.int32),
+        sl: T.Tensor([batch], T.int32),
+        Out: T.Tensor([batch, heads, dim], T.float16),
+    ):
+        with T.Kernel(heads, batch, threads=threads) as (bx, bz):
+            Qs = T.alloc_shared([block_M, dim], T.float16)
+            Ks = T.alloc_shared([block_N, dim], T.float16)
+            Vs = T.alloc_shared([block_N, dim], T.float16)
+            Ps = T.alloc_shared([block_M, block_N], T.float16)
+
+            As = T.alloc_fragment([block_M, block_N], T.float32)
+            Ac = T.alloc_fragment([block_M, block_N], T.float16)
+            Ao = T.alloc_fragment([block_M, dim], T.float32)
+
+            mi = T.alloc_fragment([block_M], T.float32)
+            mp = T.alloc_fragment([block_M], T.float32)
+            sf = T.alloc_fragment([block_M], T.float32)
+            rs = T.alloc_fragment([block_M], T.float32)
+
+            # Shared memory for l_i — bypasses 1D fragment layout conflict with mi
+            li = T.alloc_shared([block_M], T.float32)
+
+            kvh = bx // (heads // heads_kv)
+
+            T.copy(Q[bz, bx, :], Qs[0, :])
+            T.fill(Ao, 0)
+            T.fill(mi, -T.infinity(T.float32))
+            T.fill(li, 0)
+
+            for k in T.Pipelined(T.ceildiv(sl[bz], block_N), num_stages=num_stages):
+                T.clear(Ks)
+                for p in T.serial(pts):
+                    lp = T.floordiv(k * block_N, page_block_size) + p
+                    if lp < max_blocks_per_seq:
+                        ph = bt[bz, lp]
+                        po = p * page_block_size
+                        for i, j in T.Parallel(page_block_size, dim):
+                            Ks[po + i, j] = Kc[ph, i, kvh, j]
+
+                for i, j in T.Parallel(block_M, block_N):
+                    As[i, j] = T.if_then_else(k * block_N + j < sl[bz], T.cast(0, T.float32), -T.infinity(T.float32))
+                T.gemm(Qs, Ks, As, transpose_B=True, policy=GemmWarpPolicy.FullRow)
+
+                T.copy(mi, mp)
+                T.reduce_max(As, mi, dim=1, clear=False)
+                for i in T.Parallel(block_M):
+                    mi[i] = T.if_then_else(mi[i] == -T.infinity(T.float32), T.cast(0, T.float32), mi[i])
+                for i in T.Parallel(block_M):
+                    mi[i] = T.max(mi[i], mp[i])
+                for i in T.Parallel(block_M):
+                    sf[i] = T.exp(mp[i] * scale - mi[i] * scale)
+                    li[i] *= sf[i]
+                for i, j in T.Parallel(block_M, dim):
+                    Ao[i, j] *= sf[i]
+                for i, j in T.Parallel(block_M, block_N):
+                    As[i, j] = T.exp(As[i, j] * scale - mi[i] * scale)
+                T.reduce_sum(As, rs, dim=1)
+                for i in T.Parallel(block_M):
+                    li[i] += rs[i]
+
+                T.clear(Vs)
+                for p in T.serial(pts):
+                    lp2 = T.floordiv(k * block_N, page_block_size) + p
+                    if lp2 < max_blocks_per_seq:
+                        ph2 = bt[bz, lp2]
+                        po2 = p * page_block_size
+                        for i, j in T.Parallel(page_block_size, dim):
+                            Vs[po2 + i, j] = Vc[ph2, i, kvh, j]
+
+                for i, j in T.Parallel(block_M, block_N):
+                    Ps[i, j] = T.cast(As[i, j], T.float16)
+                T.copy(Ps, Ac)
+                T.gemm(Ac, Vs, Ao, policy=GemmWarpPolicy.Square)
+
+            for i, j in T.Parallel(block_M, dim):
+                if i == 0:
+                    Out[bz, bx, j] = T.cast(Ao[i, j] / li[i], T.float16)
+
+    return kernel
+
+
+_DECODE_JIT = tilelang.jit(out_idx=[5])(_decode_kernel_func)
+_DECODE_CACHE = {}
+
+_DECODE_BEST_CONFIGS = {
+    64:  dict(block_N=128, threads=128, num_stages=0),
+    128: dict(block_N=128, threads=128, num_stages=0),
+    256: dict(block_N=64,  threads=128, num_stages=0),
+}
+
+
+def get_decode_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
+                      max_blocks):
+    cfg = _DECODE_BEST_CONFIGS.get(dim, dict(block_N=128, threads=128, num_stages=0))
+    key = (heads, heads_kv, dim, block_size, cfg["block_N"], cfg["threads"], cfg["num_stages"])
+    if key not in _DECODE_CACHE:
+        kt = tilelang.jit(out_idx=[5])(_decode_kernel_func).compile(
+            batch=batch, heads=heads, heads_kv=heads_kv, dim=dim,
+            page_block_size=block_size, max_blocks_per_seq=max_blocks,
+            num_pages=num_pages, **cfg,
+        )
+        _DECODE_CACHE[key] = kt
+    return _DECODE_CACHE[key]
+
