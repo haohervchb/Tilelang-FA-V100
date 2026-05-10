@@ -7,18 +7,24 @@ from tilelang.tileop.base import GemmWarpPolicy
 from ._configs import get_paged_configs
 
 
-def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
-                       max_blocks_per_seq, num_pages, num_tokens,
-                       tokens_per_seq, is_causal,
-                       block_M=32, block_N=128, num_stages=0, threads=256):
-    total_padded = num_pages * page_block_size
+def _paged_kernel_func_4d(batch, heads, heads_kv, dim, page_block_size,
+                          max_blocks_per_seq, num_pages, num_tokens,
+                          tokens_per_seq, is_causal,
+                          block_M=32, block_N=128, num_stages=0, threads=256):
+    """Paged FA forward reading directly from vLLM's 4D KV cache.
+    
+    K/V layout: [num_pages, page_block_size, heads_kv, dim]
+    block_table: [batch, max_blocks_per_seq] — page indices
+    For each KV tile (block_N tokens), reads from ceil(block_N/page_block_size) pages.
+    """
     scale = (1.0 / dim) ** 0.5
+    pages_per_tile = block_N // page_block_size
 
     @T.prim_func
     def main(
         Q: T.Tensor([num_tokens, heads, dim], T.float16),
-        K_cache: T.Tensor([total_padded, heads_kv, dim], T.float16),
-        V_cache: T.Tensor([total_padded, heads_kv, dim], T.float16),
+        K_cache: T.Tensor([num_pages, page_block_size, heads_kv, dim], T.float16),
+        V_cache: T.Tensor([num_pages, page_block_size, heads_kv, dim], T.float16),
         block_table: T.Tensor([batch, max_blocks_per_seq], T.int32),
         cache_seqlens: T.Tensor([batch], T.int32),
         Output: T.Tensor([num_tokens, heads, dim], T.float16),
@@ -55,11 +61,13 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
             )
 
             for k in T.Pipelined(loop_end, num_stages=num_stages):
-                logical_page = T.floordiv(k * block_N, page_block_size)
-                page_offset = T.floormod(k * block_N, page_block_size)
-                phys_start = block_table[bz, logical_page]
-                kv_start = phys_start + page_offset
-                T.copy(K_cache[kv_start: kv_start + block_N, kv_head, :], K_shared)
+                # Load K tile from 4D paged cache, page by page
+                for p in T.serial(pages_per_tile):
+                    logical_page = T.floordiv(k * block_N, page_block_size) + p
+                    phys = block_table[bz, logical_page]
+                    po = p * page_block_size
+                    for i, j in T.Parallel(page_block_size, dim):
+                        K_shared[po + i, j] = K_cache[phys, i, kv_head, j]
 
                 if is_causal:
                     for i, j in T.Parallel(block_M, block_N):
@@ -88,11 +96,13 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                 for i in T.Parallel(block_M):
                     l_i[i] += row_sum[i]
 
-                logical_page2 = T.floordiv(k * block_N, page_block_size)
-                page_offset2 = T.floormod(k * block_N, page_block_size)
-                phys_start2 = block_table[bz, logical_page2]
-                kv_start2 = phys_start2 + page_offset2
-                T.copy(V_cache[kv_start2: kv_start2 + block_N, kv_head, :], V_shared)
+                # Load V tile from 4D paged cache
+                for p in T.serial(pages_per_tile):
+                    logical_page2 = T.floordiv(k * block_N, page_block_size) + p
+                    phys2 = block_table[bz, logical_page2]
+                    po2 = p * page_block_size
+                    for i, j in T.Parallel(page_block_size, dim):
+                        V_shared[po2 + i, j] = V_cache[phys2, i, kv_head, j]
 
                 for i, j in T.Parallel(block_M, block_N):
                     P_shared[i, j] = T.cast(acc_s[i, j], T.float16)
@@ -106,42 +116,25 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
     return main
 
 
-_paged_kernel = tilelang.jit(out_idx=[5])(_paged_kernel_func)
+_paged_kernel_4d = tilelang.jit(out_idx=[5])(_paged_kernel_func_4d)
 
 
-@tilelang.autotune(configs=get_paged_configs, warmup=10, rep=10, skip_check=True)
-@tilelang.jit(out_idx=[5])
-def tilelang_paged_kernel(batch, heads, heads_kv, dim, page_block_size,
-                           max_blocks_per_seq, num_pages, num_tokens,
-                           tokens_per_seq, is_causal,
-                           block_M=32, block_N=128, num_stages=0, threads=256):
-    return _paged_kernel_func(
-        batch, heads, heads_kv, dim, page_block_size,
-        max_blocks_per_seq, num_pages, num_tokens,
-        tokens_per_seq, is_causal,
-        block_M, block_N, num_stages, threads,
-    )
-
-
-def make_paged_from_dense(Q, K, V, page_block_size=128):
-    """Convert dense 4D Q/K/V to paged format for testing."""
+def make_paged_from_dense(Q, K, V, page_block_size=16):
+    """Convert dense 4D Q/K/V to 4D paged format for testing (vLLM-compatible)."""
     B, H, M, D = Q.shape
     N = K.shape[2]
     q_flat = Q.permute(0, 2, 1, 3).reshape(B * M, H, D).contiguous()
     pages_per_seq = int(math.ceil(N / page_block_size))
     num_pages = B * pages_per_seq
-    total_padded = num_pages * page_block_size
-    k_cache = torch.zeros(total_padded, H, D, dtype=torch.float16, device='cuda')
-    v_cache = torch.zeros(total_padded, H, D, dtype=torch.float16, device='cuda')
+    k_cache = torch.zeros(num_pages, page_block_size, H, D, dtype=torch.float16, device='cuda')
+    v_cache = torch.zeros(num_pages, page_block_size, H, D, dtype=torch.float16, device='cuda')
     for i in range(B):
         for j in range(N):
             page = j // page_block_size
             offset = j % page_block_size
-            abs_pos = (i * pages_per_seq + page) * page_block_size + offset
-            k_cache[abs_pos, :, :] = K[i, :, j, :]
-            v_cache[abs_pos, :, :] = V[i, :, j, :]
-    block_table = (torch.arange(num_pages, dtype=torch.int32, device='cuda')
-                   .view(B, pages_per_seq) * page_block_size)
+            k_cache[i * pages_per_seq + page, offset, :, :] = K[i, :, j, :]
+            v_cache[i * pages_per_seq + page, offset, :, :] = V[i, :, j, :]
+    block_table = torch.arange(num_pages, dtype=torch.int32, device='cuda').view(B, pages_per_seq)
     seq_lens = torch.full((B,), N, dtype=torch.int32, device='cuda')
     return dict(
         Q_flat=q_flat, K_cache=k_cache, V_cache=v_cache,
