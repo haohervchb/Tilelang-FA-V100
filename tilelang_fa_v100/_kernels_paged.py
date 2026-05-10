@@ -60,12 +60,15 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
             for k in T.Pipelined(loop_end, num_stages=num_stages):
                 # Load K page-by-page from 4D paged cache
                 # Each page is [page_block_size, heads_kv, dim]; a tile spans pages_per_tile pages
+                # Zero-init K_shared so OOB pages (beyond block_table) contribute zeros, not NaN
+                T.clear(K_shared)
                 for p in T.serial(pages_per_tile):
                     logical_page = T.floordiv(k * block_N, page_block_size) + p
-                    phys = block_table[bz, logical_page]
-                    po = p * page_block_size
-                    for i, j in T.Parallel(page_block_size, dim):
-                        K_shared[po + i, j] = K_cache[phys, i, kv_head, j]
+                    if logical_page < max_blocks_per_seq:
+                        phys = block_table[bz, logical_page]
+                        po = p * page_block_size
+                        for i, j in T.Parallel(page_block_size, dim):
+                            K_shared[po + i, j] = K_cache[phys, i, kv_head, j]
 
                 if is_causal:
                     for i, j in T.Parallel(block_M, block_N):
@@ -107,12 +110,15 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                     l_i[i] += row_sum[i]
 
                 # Load V page-by-page
+                # Zero-init V_shared so OOB pages contribute zeros, not NaN
+                T.clear(V_shared)
                 for p in T.serial(pages_per_tile):
                     logical_page2 = T.floordiv(k * block_N, page_block_size) + p
-                    phys2 = block_table[bz, logical_page2]
-                    po2 = p * page_block_size
-                    for i, j in T.Parallel(page_block_size, dim):
-                        V_shared[po2 + i, j] = V_cache[phys2, i, kv_head, j]
+                    if logical_page2 < max_blocks_per_seq:
+                        phys2 = block_table[bz, logical_page2]
+                        po2 = p * page_block_size
+                        for i, j in T.Parallel(page_block_size, dim):
+                            V_shared[po2 + i, j] = V_cache[phys2, i, kv_head, j]
 
                 for i, j in T.Parallel(block_M, block_N):
                     P_shared[i, j] = T.cast(acc_s[i, j], T.float16)
