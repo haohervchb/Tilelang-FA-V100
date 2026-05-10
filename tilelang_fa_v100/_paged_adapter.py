@@ -11,6 +11,10 @@ from ._kernels_paged import get_paged_kernel
 warnings.filterwarnings("ignore", message="Field.*duplicates an ancestor field")
 warnings.filterwarnings("ignore", message=".*GemmSPWarpPolicy.*")
 
+# Fixed max pages for a stable kernel cache key.
+# Must >= model's max_num_blocks. A100/V100: 262144/16 ≈ 16384 pages.
+_MAX_PAGES = 32768  # generous upper bound for --max-model-len up to 524288
+
 
 def paged_forward(q, k_cache, v_cache, block_table, seq_lens,
                   query_start_loc, prefix_kv_lens, out=None,
@@ -28,15 +32,31 @@ def paged_forward(q, k_cache, v_cache, block_table, seq_lens,
     num_blocks = k_cache.shape[0]
     max_blocks = block_table.shape[1]
 
+    # Pad cache to _MAX_PAGES if needed (ensures stable kernel compilation)
+    if num_blocks < _MAX_PAGES:
+        pad = _MAX_PAGES - num_blocks
+        k_cached = torch.cat([k_cache, torch.zeros(pad, block_size, heads_kv, D,
+                                                    dtype=k_cache.dtype, device=k_cache.device)])
+        v_cached = torch.cat([v_cache, torch.zeros(pad, block_size, heads_kv, D,
+                                                    dtype=v_cache.dtype, device=v_cache.device)])
+    else:
+        k_cached = k_cache
+        v_cached = v_cache
+
+    # Pad block_table too
+    if max_blocks < _MAX_PAGES:
+        pad_bt = _MAX_PAGES - max_blocks
+        bt_padded = torch.cat([block_table, torch.zeros(B, pad_bt, dtype=torch.int32, device=block_table.device)], dim=1)
+    else:
+        bt_padded = block_table
+
     kernel_compiled = get_paged_kernel(
         batch=B, heads=num_heads, heads_kv=heads_kv, dim=D,
-        block_size=block_size, num_pages=num_blocks,
-        max_blocks=max_blocks, causal=causal,
+        block_size=block_size, num_pages=_MAX_PAGES,
+        max_blocks=_MAX_PAGES, causal=causal,
     )
 
-    # Pass 4D cache directly + block_table as page indices
-    # Kernel loads each tile page-by-page: block_table[b, L] gives physical page
-    result = kernel_compiled(q, k_cache, v_cache, block_table, seq_lens,
+    result = kernel_compiled(q, k_cached, v_cached, bt_padded, seq_lens,
                              num_tokens)
 
     softmax_lse = torch.empty(num_heads, num_tokens, dtype=torch.float32, device=q.device)

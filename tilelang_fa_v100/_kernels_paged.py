@@ -79,6 +79,16 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                     T.clear(acc_s)
 
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=GemmWarpPolicy.FullRow)
+
+                # Mask out-of-range KV positions (beyond cache_seqlens[bz])
+                # Required even for non-causal: last tile includes zero-padded pages
+                for i, j in T.Parallel(block_M, block_N):
+                    kv_pos = k * block_N + j
+                    acc_s[i, j] = T.if_then_else(
+                        kv_pos >= cache_seqlens[bz],
+                        -T.infinity(acc_s.dtype), acc_s[i, j]
+                    )
+
                 T.copy(m_i, m_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
                 for i in T.Parallel(block_M):
