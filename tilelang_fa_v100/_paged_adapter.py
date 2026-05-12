@@ -28,19 +28,29 @@ def paged_forward(q, k_cache, v_cache, block_table, seq_lens,
     num_blocks = k_cache.shape[0]
     max_blocks = block_table.shape[1]
 
-    kernel_compiled = get_paged_kernel(
-        batch=B, heads=num_heads, heads_kv=heads_kv, dim=D,
+    kernel_batch1 = get_paged_kernel(
+        batch=1, heads=num_heads, heads_kv=heads_kv, dim=D,
         block_size=block_size, num_pages=num_blocks,
         max_blocks=max_blocks, causal=causal,
     )
 
-    # Pass 4D cache directly + block_table as page indices
-    # Kernel loads each tile page-by-page: block_table[b, L] gives physical page
-    result = kernel_compiled(q, k_cache, v_cache, block_table, seq_lens,
-                             num_tokens)
-
-    # Copy kernel output into the caller-provided 'out' tensor
-    out.copy_(result)
+    if B > 1:
+        q_lens = (query_start_loc[1:] - query_start_loc[:-1])
+        for b in range(B):
+            b_start = query_start_loc[b].item()
+            b_len = q_lens[b].item()
+            if b_len <= 0:
+                continue
+            b_end = b_start + b_len
+            result_b = kernel_batch1(
+                q[b_start:b_end], k_cache, v_cache,
+                block_table[b:b+1], seq_lens[b:b+1],
+                b_len,
+            )
+            out[b_start:b_end] = result_b
+    else:
+        result = kernel_batch1(q, k_cache, v_cache, block_table, seq_lens, num_tokens)
+        out.copy_(result)
 
     softmax_lse = torch.empty(num_heads, num_tokens, dtype=torch.float32, device=q.device)
     return out, softmax_lse
