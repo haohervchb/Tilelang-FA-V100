@@ -275,7 +275,8 @@ def get_paged_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
                      max_blocks, causal):
     """Return compiled kernel. Compiles ONCE per (heads, dim, block_size, causal, config)."""
     cfg = _BEST_CONFIGS.get(dim, dict(block_M=32, block_N=128, threads=256, num_stages=0, num_splits=1))
-    key = (heads, heads_kv, dim, block_size, causal,
+    key = (batch, heads, heads_kv, dim, block_size, causal,
+           max_blocks, num_pages,
            cfg["block_M"], cfg["block_N"], cfg["threads"], cfg["num_stages"], cfg["num_splits"])
     if key not in _KERNEL_CACHE:
         kt = tilelang.jit(out_idx=[6])(_paged_kernel_func).compile(
