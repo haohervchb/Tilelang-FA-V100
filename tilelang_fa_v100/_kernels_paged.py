@@ -284,7 +284,8 @@ def get_paged_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
     """Return compiled kernel. Compiles ONCE per (heads, dim, block_size, causal, config)."""
     cfg = _BEST_CONFIGS.get(dim, dict(block_M=32, block_N=128, threads=256, num_stages=0, num_splits=1))
     key = (heads, heads_kv, dim, block_size, causal,
-           cfg["block_M"], cfg["block_N"], cfg["threads"], cfg["num_stages"], cfg["num_splits"])
+           cfg["block_M"], cfg["block_N"], cfg["threads"], cfg["num_stages"], cfg["num_splits"],
+           batch, max_blocks, num_pages)
     if key not in _KERNEL_CACHE:
         kt = tilelang.jit(out_idx=[9])(_paged_kernel_func).compile(
             batch=batch, heads=heads, heads_kv=heads_kv, dim=dim,
@@ -408,7 +409,8 @@ _DECODE_BEST_CONFIGS = {
 def get_decode_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
                       max_blocks):
     cfg = _DECODE_BEST_CONFIGS.get(dim, dict(block_N=128, threads=128, num_stages=0))
-    key = (heads, heads_kv, dim, block_size, cfg["block_N"], cfg["threads"], cfg["num_stages"])
+    key = (heads, heads_kv, dim, block_size, cfg["block_N"], cfg["threads"], cfg["num_stages"],
+           batch, max_blocks, num_pages)
     if key not in _DECODE_CACHE:
         kt = tilelang.jit(out_idx=[5])(_decode_kernel_func).compile(
             batch=batch, heads=heads, heads_kv=heads_kv, dim=dim,
