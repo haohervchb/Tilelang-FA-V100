@@ -273,7 +273,7 @@ _KERNEL_CACHE = {}
 _BEST_CONFIGS = {
     64: dict(block_M=32, block_N=128, threads=256, num_stages=0, num_splits=1),
     128: dict(block_M=32, block_N=128, threads=256, num_stages=0, num_splits=1),
-    256: dict(block_M=32, block_N=64, threads=256, num_stages=0, num_splits=1),
+    256: dict(block_M=64, block_N=32, threads=256, num_stages=0, num_splits=1),
 }
 
 
