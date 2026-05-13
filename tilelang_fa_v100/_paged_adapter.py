@@ -36,8 +36,13 @@ def paged_forward(q, k_cache, v_cache, block_table, seq_lens,
 
     # Pass 4D cache directly + block_table as page indices
     # Kernel loads each tile page-by-page: block_table[b, L] gives physical page
-    result = kernel_compiled(q, k_cache, v_cache, block_table, seq_lens,
-                             num_tokens)
+    result = kernel_compiled(
+        q, k_cache, v_cache, block_table, seq_lens,
+        query_start_loc.contiguous().to(device=q.device, dtype=torch.int32),
+        prefix_kv_lens.contiguous().to(device=q.device, dtype=torch.int32),
+        num_tokens,
+        softmax_scale,
+    )
 
     # Copy kernel output into the caller-provided 'out' tensor
     out.copy_(result)
