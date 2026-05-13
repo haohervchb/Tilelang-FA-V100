@@ -65,7 +65,7 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                 out_sum = T.alloc_fragment([block_M, dim], T.float32)
                 old_max = T.alloc_fragment([block_M], T.float32)
 
-                with T.If(bx * block_M < q_len):
+                with T.If(bx * block_M < q_len), T.Then():
                     T.copy(Q[start_q: start_q + block_M, by, :], Q_shared)
 
                     T.fill(max_state, -T.infinity(T.float32))
@@ -191,7 +191,7 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                     q_len = query_start_loc[bz + 1] - query_start_loc[bz]
                     start_q = query_start_loc[bz] + bx * block_M
 
-                    with T.If(bx * block_M < q_len):
+                    with T.If(bx * block_M < q_len), T.Then():
                         T.copy(Q[start_q: start_q + block_M, by, :], Q_shared)
                         T.fill(acc_o, 0)
                         T.fill(m_i, -T.infinity(T.float32))
