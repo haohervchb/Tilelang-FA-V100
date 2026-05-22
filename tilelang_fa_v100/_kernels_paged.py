@@ -339,6 +339,7 @@ def _decode_kernel_func(batch, heads, heads_kv, dim, page_block_size,
 
             kvh = bx // (heads // heads_kv)
 
+            T.clear(Qs)
             T.copy(Q[bz, bx, :], Qs[0, :])
             T.fill(Ao, 0)
             T.fill(mi, -T.infinity(T.float32))
