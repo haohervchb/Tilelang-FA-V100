@@ -392,7 +392,10 @@ def _decode_kernel_func(batch, heads, heads_kv, dim, page_block_size,
 
             for i, j in T.Parallel(block_M, dim):
                 if i == 0:
-                    Out[bz, bx, j] = T.cast(Ao[i, j] / li[i], T.float16)
+                    Out[bz, bx, j] = T.if_then_else(
+                        li[i] > 0,
+                        T.cast(Ao[i, j] / li[i], T.float16),
+                        T.cast(0, T.float16))
 
     return kernel
 
@@ -403,7 +406,7 @@ _DECODE_CACHE = {}
 _DECODE_BEST_CONFIGS = {
     64:  dict(block_N=128, threads=128, num_stages=0),
     128: dict(block_N=128, threads=128, num_stages=0),
-    256: dict(block_N=64,  threads=128, num_stages=0),
+    256: dict(block_N=16,  threads=32,  num_stages=0),
 }
 
 
