@@ -432,12 +432,10 @@ def get_decode_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
 def _decode_gemv_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                               max_blocks_per_seq, num_pages,
                               block_N=16, num_stages=0, threads=256):
-    """SIMT FMA GEMV decode kernel — avoids MMA for single-token decode.
+    """SIMT FMA GEMV decode — tree reduction, zero conditional barriers.
 
-    All computation uses shared memory + T.Parallel + T.serial.
-    Zero fragment usage, zero tensor core usage.
-    Block_M = 1 (no row padding).
-    Reductions done by thread 0 via T.serial loops.
+    Every T.Parallel has all threads participating; T.Parallel(1) only
+    for the final l_running RMW (guarded by subsequent all-thread barrier).
     """
     scale = (1.0 / dim) ** 0.5
 
@@ -455,26 +453,24 @@ def _decode_gemv_kernel_func(batch, heads, heads_kv, dim, page_block_size,
             Ks = T.alloc_shared([block_N, dim], T.float16)
             Vs = T.alloc_shared([block_N, dim], T.float16)
 
-            m_shared = T.alloc_shared([1], T.float32)
-            l_shared = T.alloc_shared([1], T.float32)
-            sf_shared = T.alloc_shared([1], T.float32)
-            tsum_shared = T.alloc_shared([1], T.float32)
-            m_cur_shared = T.alloc_shared([1], T.float32)
-
-            temp_smem = T.alloc_shared([block_N, dim], T.float32)
-            scores_smem = T.alloc_shared([block_N], T.float32)
+            product = T.alloc_shared([block_N, dim], T.float32)
+            raw_score = T.alloc_shared([block_N], T.float32)
+            scaled_score = T.alloc_shared([block_N], T.float32)
+            reduce_out = T.alloc_shared([block_N], T.float32)
             acc_v_smem = T.alloc_shared([dim], T.float32)
-            acc_partial_smem = T.alloc_shared([dim], T.float32)
+            m_running = T.alloc_shared([1], T.float32)
+            l_running = T.alloc_shared([1], T.float32)
+            sf_scratch = T.alloc_shared([1], T.float32)
 
             kvh = bx // (heads // heads_kv)
 
             T.copy(Q[bz, bx, :], Qs)
             T.clear(acc_v_smem)
-            T.fill(m_shared, -T.infinity(T.float32))
-            T.fill(l_shared, 0)
+            T.fill(m_running, -T.infinity(T.float32))
+            T.fill(l_running, 0)
 
             for k in T.Pipelined(T.ceildiv(sl[bz], block_N), num_stages=num_stages):
-                # ── Load K tile (1 page per iteration) ──
+                # ── Load K tile ──
                 T.clear(Ks)
                 lp = k
                 if lp < max_blocks_per_seq:
@@ -482,60 +478,98 @@ def _decode_gemv_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                     for i, j in T.Parallel(page_block_size, dim):
                         Ks[i, j] = Kc[ph, i, kvh, j]
 
-                # ── Q×K^T GEMV: element-wise products into shared memory ──
+                # ═══ PHASE 1: Q×K^T → raw_score[16] ═══
+
                 for j, d in T.Parallel(block_N, dim):
-                    temp_smem[j, d] = T.cast(Qs[d], T.float32) * T.cast(Ks[j, d], T.float32)
+                    product[j, d] = T.cast(Qs[d], T.float32) * T.cast(Ks[j, d], T.float32)
 
-                # ── Reduce across dim (d) for each token j: thread 0 only ──
-                for tx in T.Parallel(threads):
-                    if tx == 0:
-                        for j in T.serial(block_N):
-                            for d in T.serial(dim):
-                                val = temp_smem[j, d]
-                                scores_smem[j] = T.if_then_else(
-                                    d == 0, val, scores_smem[j] + val)
+                for j, d in T.Parallel(block_N, 128):
+                    product[j, d] += product[j, d + 128]
+                for j, d in T.Parallel(block_N, 64):
+                    product[j, d] += product[j, d + 64]
+                for j, d in T.Parallel(block_N, 32):
+                    product[j, d] += product[j, d + 32]
+                for j, d in T.Parallel(block_N, 16):
+                    product[j, d] += product[j, d + 16]
+                for j, d in T.Parallel(block_N, 8):
+                    product[j, d] += product[j, d + 8]
+                for j, d in T.Parallel(block_N, 4):
+                    product[j, d] += product[j, d + 4]
+                for j, d in T.Parallel(block_N, 2):
+                    product[j, d] += product[j, d + 2]
+                for j, d in T.Parallel(block_N, 1):
+                    product[j, d] += product[j, d + 1]
 
-                # ── Scale + mask ──
                 for j in T.Parallel(block_N):
-                    token_idx = k * block_N + j
-                    scores_smem[j] = T.if_then_else(
-                        token_idx < sl[bz],
-                        scores_smem[j] * scale,
+                    raw_score[j] = product[j, 0]
+
+                # ═══ PHASE 2: Scale + mask → scaled_score[16] ═══
+
+                for j in T.Parallel(block_N):
+                    scaled_score[j] = T.if_then_else(
+                        k * block_N + j < sl[bz],
+                        raw_score[j] * scale,
                         -T.infinity(T.float32))
 
-                # ── Online softmax: all threads redundantly compute max/sf ──
-                # First, thread 0 reduces to shared for score reduction and tsum
-                for tx in T.Parallel(threads):
-                    if tx == 0:
-                        for j in T.serial(block_N):
-                            m_cur_shared[0] = T.if_then_else(
-                                j == 0,
-                                scores_smem[j],
-                                T.max(m_cur_shared[0], scores_smem[j]))
-                        m_cur_shared[0] = T.if_then_else(
-                            m_cur_shared[0] == -T.infinity(T.float32),
-                            T.cast(0, T.float32),
-                            m_cur_shared[0])
-                        old_m = m_shared[0]
-                        new_m = T.max(old_m, m_cur_shared[0])
-                        m_shared[0] = new_m
-                        sf_shared[0] = T.exp(old_m - new_m)
+                # ═══ PHASE 3: Max reduction (16 → 1) ═══
 
-                        for j in T.serial(block_N):
-                            tsum_shared[0] = T.if_then_else(
-                                j == 0,
-                                T.exp(scores_smem[j] - new_m),
-                                tsum_shared[0] + T.exp(scores_smem[j] - new_m))
-
-                        l_shared[0] = l_shared[0] * sf_shared[0] + tsum_shared[0]
-
-                # ── Convert scores to softmax probs (needed for PV) ──
                 for j in T.Parallel(block_N):
-                    scores_smem[j] = T.exp(scores_smem[j] - m_shared[0])
+                    reduce_out[j] = scaled_score[j]
+                for j in T.Parallel(8):
+                    reduce_out[j] = T.max(reduce_out[j], reduce_out[j + 8])
+                for j in T.Parallel(4):
+                    reduce_out[j] = T.max(reduce_out[j], reduce_out[j + 4])
+                for j in T.Parallel(2):
+                    reduce_out[j] = T.max(reduce_out[j], reduce_out[j + 2])
+                for j in T.Parallel(1):
+                    reduce_out[j] = T.max(reduce_out[j], reduce_out[j + 1])
+                m_cur = reduce_out[0]
 
-                # ── Rescale accumulator (all threads, use sf from shared) ──
+                # ═══ PHASE 4: sf computation (thread 0 to sf_scratch) ═══
+
+                for _ in T.Parallel(1):
+                    clamped = T.if_then_else(
+                        m_cur == -T.infinity(T.float32),
+                        T.cast(0, T.float32), m_cur)
+                    old_m = m_running[0]
+                    new_m_val = T.max(old_m, clamped)
+                    sf_scratch[0] = T.exp(old_m - new_m_val)
+                    m_running[0] = new_m_val
+
+                # ═══ PHASE 5: tsum tree sum (16 → 1) ═══
+
+                for j in T.Parallel(block_N):
+                    reduce_out[j] = T.if_then_else(
+                        scaled_score[j] == -T.infinity(T.float32),
+                        T.cast(-T.infinity(T.float32), T.float32),
+                        T.exp(scaled_score[j] - m_running[0]))
+                for j in T.Parallel(8):
+                    reduce_out[j] += reduce_out[j + 8]
+                for j in T.Parallel(4):
+                    reduce_out[j] += reduce_out[j + 4]
+                for j in T.Parallel(2):
+                    reduce_out[j] += reduce_out[j + 2]
+                for j in T.Parallel(1):
+                    reduce_out[j] += reduce_out[j + 1]
+                tsum_val = reduce_out[0]
+
+                # ═══ PHASE 6: l_running RMW (thread 0 only) ═══
+
+                for _ in T.Parallel(1):
+                    l_running[0] = l_running[0] * sf_scratch[0] + tsum_val
+
+                # ═══ PHASE 7: Rescale accumulator ═══
+
                 for d in T.Parallel(dim):
-                    acc_v_smem[d] *= sf_shared[0]
+                    acc_v_smem[d] *= sf_scratch[0]
+
+                # ═══ PHASE 8: Softmax probs + PV ═══
+
+                for j in T.Parallel(block_N):
+                    reduce_out[j] = T.if_then_else(
+                        k * block_N + j < sl[bz],
+                        T.exp(raw_score[j] * scale - m_running[0]),
+                        T.cast(0, T.float32))
 
                 # ── Load V tile ──
                 T.clear(Vs)
@@ -544,28 +578,30 @@ def _decode_gemv_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                     for i, j in T.Parallel(page_block_size, dim):
                         Vs[i, j] = Vc[ph2, i, kvh, j]
 
-                # ── P×V GEMV: scores[j] * V[j,d] into shared memory ──
+                # ── PV products ──
                 for j, d in T.Parallel(block_N, dim):
-                    temp_smem[j, d] = scores_smem[j] * T.cast(Vs[j, d], T.float32)
+                    product[j, d] = reduce_out[j] * T.cast(Vs[j, d], T.float32)
 
-                # ── Reduce across token dim (j) for each output dim d: thread 0 ──
-                for tx in T.Parallel(threads):
-                    if tx == 0:
-                        for d in T.serial(dim):
-                            for j in T.serial(block_N):
-                                val = temp_smem[j, d]
-                                acc_partial_smem[d] = T.if_then_else(
-                                    j == 0, val, acc_partial_smem[d] + val)
+                # ── PV tree reduction (16 → 1 per d) ──
+                for j, d in T.Parallel(8, dim):
+                    product[j, d] += product[j + 8, d]
+                for j, d in T.Parallel(4, dim):
+                    product[j, d] += product[j + 4, d]
+                for j, d in T.Parallel(2, dim):
+                    product[j, d] += product[j + 2, d]
+                for j, d in T.Parallel(1, dim):
+                    product[j, d] += product[j + 1, d]
 
-                # ── Accumulate into running output (all threads) ──
+                # ── Accumulate ──
                 for d in T.Parallel(dim):
-                    acc_v_smem[d] += acc_partial_smem[d]
+                    acc_v_smem[d] += product[0, d]
 
-            # ── Output (guard against l==0 for empty sequences) ──
+            # ═══ Output ═══
+
             for d in T.Parallel(dim):
                 Out[bz, bx, d] = T.if_then_else(
-                    l_shared[0] > T.cast(0, T.float32),
-                    T.cast(acc_v_smem[d] / l_shared[0], T.float16),
+                    l_running[0] > T.cast(0, T.float32),
+                    T.cast(acc_v_smem[d] / l_running[0], T.float16),
                     T.cast(0, T.float16))
 
     return kernel
