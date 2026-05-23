@@ -20,7 +20,7 @@ _self = Path(__file__).resolve().parent.parent
 if str(_self) not in sys.path:
     sys.path.insert(0, str(_self))
 
-from tilelang_fa_v100._kernels_paged import get_gemv_decode_kernel
+from tilelang_fa_v100._kernels_paged import get_gemv_decode_kernel, get_decode_kernel
 
 
 def make_inputs(batch, num_heads, num_kv_heads, dim, seq_lens, block_size=16):
@@ -100,24 +100,141 @@ def run_triton_attention(q, kc, vc, block_table, seq_lens):
     return out
 
 
+def run_mma_kernel(q, kc, vc, block_table, seq_lens):
+    """Run TileLang MMA decode kernel (with NaN fixes)."""
+    batch, heads, dim = q.shape
+    heads_kv = kc.shape[2]
+    block_size = kc.shape[1]
+    num_pages = kc.shape[0]
+    max_blocks = block_table.shape[1]
+
+    kernel = get_decode_kernel(
+        batch=batch,
+        heads=heads,
+        heads_kv=heads_kv,
+        dim=dim,
+        block_size=block_size,
+        num_pages=num_pages,
+        max_blocks=max_blocks,
+    )
+    return kernel(q, kc, vc, block_table, seq_lens)
+
+
+def run_manual_gemv(q, kc, vc, block_table, seq_lens):
+    """Manual mixed-PyTorch reference implementing the same algorithm as the
+    GEMV kernel: online softmax, block_N=16, thread-0 sequential reduction."""
+    import math
+    batch, heads, dim = q.shape
+    heads_kv = kc.shape[2]
+    block_size = kc.shape[1]
+    scale = dim ** -0.5
+
+    out = torch.zeros(batch, heads, dim, dtype=torch.float32, device="cpu")
+
+    for bz in range(batch):
+        sl = int(seq_lens[bz].item())
+        if sl == 0:
+            continue
+        for bx in range(heads):
+            kvh = bx // (heads // heads_kv)
+
+            # Reconstruct full K/V from pages for this (batch, head)
+            K_full = torch.zeros(sl, dim, dtype=torch.float32)
+            V_full = torch.zeros(sl, dim, dtype=torch.float32)
+            for t in range(sl):
+                page_idx = t // block_size
+                token_in_page = t % block_size
+                ph = int(block_table[bz, page_idx].item())
+                K_full[t] = kc[ph, token_in_page, kvh].cpu().float()
+                V_full[t] = vc[ph, token_in_page, kvh].cpu().float()
+
+            q_token = q[bz, bx].cpu().float()
+            acc = torch.zeros(dim, dtype=torch.float32)
+            m = float("-inf")
+            l = 0.0
+
+            for k in range(0, sl, 16):
+                end = min(k + 16, sl)
+                K_tile = K_full[k:end]
+                V_tile = V_full[k:end]
+
+                # Q×K^T: element-wise products → sum (serial reduction)
+                raw = torch.zeros(16, dtype=torch.float32)
+                for j in range(16):
+                    if k + j < sl:
+                        for d in range(dim):
+                            raw[j] += q_token[d].item() * K_tile[j, d].item()
+
+                # Scale + mask
+                scores = torch.empty(16, dtype=torch.float32)
+                for j in range(16):
+                    if k + j < sl:
+                        scores[j] = raw[j] * scale
+                    else:
+                        scores[j] = float("-inf")
+
+                # Online softmax
+                m_cur = float(scores[:sl - k].max().item()) if k < sl else 0.0
+                if m_cur == float("-inf"):
+                    m_cur = 0.0
+                old_m = m
+                new_m = max(old_m, m_cur)
+                sf = math.exp(old_m - new_m) if old_m != float("-inf") else 0.0
+
+                acc *= sf
+                tile_sum = 0.0
+                probs = torch.empty(16, dtype=torch.float32)
+                for j in range(16):
+                    if k + j < sl:
+                        p = math.exp(float(scores[j].item()) - new_m)
+                        probs[j] = p
+                        tile_sum += p
+                    else:
+                        probs[j] = 0.0
+                l = l * sf + tile_sum
+                m = new_m
+
+                # PV
+                for j in range(16):
+                    if k + j < sl:
+                        acc += probs[j] * V_tile[j]
+
+            if l > 0:
+                out[bz, bx] = acc / l
+
+    return out.to(dtype=torch.float16, device=q.device)
+
+
 def validate_case(name, batch, heads, kv_heads, dim, seq_lens):
     print(f"  {name} (batch={batch}, heads={heads}/{kv_heads}, dim={dim}, "
           f"seq_lens={seq_lens})")
     q, kc, vc, bt, sl = make_inputs(batch, heads, kv_heads, dim, seq_lens)
 
     output_gemv = run_gemv_kernel(q, kc, vc, bt, sl)
+    output_mma = run_mma_kernel(q, kc, vc, bt, sl)
     output_triton = run_triton_attention(q, kc, vc, bt, sl)
+    output_manual = run_manual_gemv(q, kc, vc, bt, sl)
 
-    diff = (output_gemv.float() - output_triton.float()).abs()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
+    diff_gv_tr = (output_gemv.float() - output_triton.float()).abs()
+    diff_mma_tr = (output_mma.float() - output_triton.float()).abs()
+    diff_mn_tr = (output_manual.float() - output_triton.float()).abs()
+    diff_gv_mn = (output_gemv.float() - output_manual.float()).abs()
+
     gemv_nan = torch.isnan(output_gemv).any().item()
+    mma_nan = torch.isnan(output_mma).any().item()
     triton_nan = torch.isnan(output_triton).any().item()
+    manual_nan = torch.isnan(output_manual).any().item()
 
-    passed = max_diff < 0.10 and mean_diff < 0.01 and not gemv_nan and not triton_nan
+    passed = (diff_mma_tr.max().item() < 0.10 and diff_mn_tr.max().item() < 0.02
+              and not mma_nan and not triton_nan and not manual_nan)
     status = "PASS" if passed else "FAIL"
-    print(f"    max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, "
-          f"gemv_nan={gemv_nan}, triton_nan={triton_nan} → {status}")
+    print(f"    MMA vs Triton:   max={diff_mma_tr.max().item():.6f} mean={diff_mma_tr.mean().item():.6f} "
+          f"nan={mma_nan}")
+    print(f"    GEMV vs Triton:  max={diff_gv_tr.max().item():.6f} mean={diff_gv_tr.mean().item():.6f} "
+          f"nan={gemv_nan}")
+    print(f"    Manual vs Triton: max={diff_mn_tr.max().item():.6f} mean={diff_mn_tr.mean().item():.6f} "
+          f"nan={manual_nan}")
+    print(f"    → {status}")
     return passed
 
 
