@@ -432,10 +432,12 @@ def get_decode_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
 def _decode_gemv_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                               max_blocks_per_seq, num_pages,
                               block_N=16, num_stages=0, threads=256):
-    """SIMT FMA GEMV decode — tree reduction, zero conditional barriers.
+    """SIMT FMA GEMV decode — ~7 barriers/tile.  Zero tensor cores.
 
-    Every T.Parallel has all threads participating; T.Parallel(1) only
-    for the final l_running RMW (guarded by subsequent all-thread barrier).
+    Q×K^T reduction: T.Parallel(block_N) + T.serial(dim) — 16 threads
+    each doing 256 serial adds.  PV reduction: T.Parallel(dim) +
+    T.serial(block_N) — 256 threads each doing 16 serial adds.
+    Scalar RMW folded into T.Parallel(dim) rescale pass.
     """
     scale = (1.0 / dim) ** 0.5
 
@@ -454,13 +456,13 @@ def _decode_gemv_kernel_func(batch, heads, heads_kv, dim, page_block_size,
             Vs = T.alloc_shared([block_N, dim], T.float16)
 
             product = T.alloc_shared([block_N, dim], T.float32)
-            raw_score = T.alloc_shared([block_N], T.float32)
-            scaled_score = T.alloc_shared([block_N], T.float32)
-            reduce_out = T.alloc_shared([block_N], T.float32)
+            score_buf = T.alloc_shared([block_N], T.float32)
             acc_v_smem = T.alloc_shared([dim], T.float32)
             m_running = T.alloc_shared([1], T.float32)
             l_running = T.alloc_shared([1], T.float32)
             sf_scratch = T.alloc_shared([1], T.float32)
+            tsum_scratch = T.alloc_shared([1], T.float32)
+            m_tmp = T.alloc_shared([1], T.float32)
 
             kvh = bx // (heads // heads_kv)
 
@@ -478,97 +480,56 @@ def _decode_gemv_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                     for i, j in T.Parallel(page_block_size, dim):
                         Ks[i, j] = Kc[ph, i, kvh, j]
 
-                # ═══ PHASE 1: Q×K^T → raw_score[16] ═══
-
+                # ═══ PHASE 1: Q×K^T products ═══
                 for j, d in T.Parallel(block_N, dim):
                     product[j, d] = T.cast(Qs[d], T.float32) * T.cast(Ks[j, d], T.float32)
 
-                for j, d in T.Parallel(block_N, 128):
-                    product[j, d] += product[j, d + 128]
-                for j, d in T.Parallel(block_N, 64):
-                    product[j, d] += product[j, d + 64]
-                for j, d in T.Parallel(block_N, 32):
-                    product[j, d] += product[j, d + 32]
-                for j, d in T.Parallel(block_N, 16):
-                    product[j, d] += product[j, d + 16]
-                for j, d in T.Parallel(block_N, 8):
-                    product[j, d] += product[j, d + 8]
-                for j, d in T.Parallel(block_N, 4):
-                    product[j, d] += product[j, d + 4]
-                for j, d in T.Parallel(block_N, 2):
-                    product[j, d] += product[j, d + 2]
-                for j, d in T.Parallel(block_N, 1):
-                    product[j, d] += product[j, d + 1]
-
+                # ═══ PHASE 2a: Q×K^T reduce + scale + mask ═══
                 for j in T.Parallel(block_N):
-                    raw_score[j] = product[j, 0]
-
-                # ═══ PHASE 2: Scale + mask → scaled_score[16] ═══
-
-                for j in T.Parallel(block_N):
-                    scaled_score[j] = T.if_then_else(
+                    score_buf[j] = T.cast(0, T.float32)
+                    for d in T.serial(dim):
+                        score_buf[j] += product[j, d]
+                    score_buf[j] = T.if_then_else(
                         k * block_N + j < sl[bz],
-                        raw_score[j] * scale,
+                        score_buf[j] * scale,
                         -T.infinity(T.float32))
 
-                # ═══ PHASE 3: Max reduction (16 → 1) ═══
-
+                # ═══ PHASE 2b: max + sf + tsum (all 16 threads redundantly) ═══
                 for j in T.Parallel(block_N):
-                    reduce_out[j] = scaled_score[j]
-                for j in T.Parallel(8):
-                    reduce_out[j] = T.max(reduce_out[j], reduce_out[j + 8])
-                for j in T.Parallel(4):
-                    reduce_out[j] = T.max(reduce_out[j], reduce_out[j + 4])
-                for j in T.Parallel(2):
-                    reduce_out[j] = T.max(reduce_out[j], reduce_out[j + 2])
-                for j in T.Parallel(1):
-                    reduce_out[j] = T.max(reduce_out[j], reduce_out[j + 1])
-                m_cur = reduce_out[0]
+                    m_tmp[0] = -T.infinity(T.float32)
+                    for j2 in T.serial(block_N):
+                        m_tmp[0] = T.max(m_tmp[0], score_buf[j2])
 
-                # ═══ PHASE 4: sf computation (thread 0 to sf_scratch) ═══
+                    m_cur_clamped = T.if_then_else(
+                        m_tmp[0] == -T.infinity(T.float32),
+                        T.cast(0, T.float32), m_tmp[0])
 
-                for _ in T.Parallel(1):
-                    clamped = T.if_then_else(
-                        m_cur == -T.infinity(T.float32),
-                        T.cast(0, T.float32), m_cur)
-                    old_m = m_running[0]
-                    new_m_val = T.max(old_m, clamped)
-                    sf_scratch[0] = T.exp(old_m - new_m_val)
-                    m_running[0] = new_m_val
+                    old_m_val = m_running[0]
+                    new_m_val = T.max(old_m_val, m_cur_clamped)
 
-                # ═══ PHASE 5: tsum tree sum (16 → 1) ═══
+                    if j == 0:
+                        m_running[0] = new_m_val
+                        sf_scratch[0] = T.exp(old_m_val - new_m_val)
 
-                for j in T.Parallel(block_N):
-                    reduce_out[j] = T.if_then_else(
-                        scaled_score[j] == -T.infinity(T.float32),
-                        T.cast(-T.infinity(T.float32), T.float32),
-                        T.exp(scaled_score[j] - m_running[0]))
-                for j in T.Parallel(8):
-                    reduce_out[j] += reduce_out[j + 8]
-                for j in T.Parallel(4):
-                    reduce_out[j] += reduce_out[j + 4]
-                for j in T.Parallel(2):
-                    reduce_out[j] += reduce_out[j + 2]
-                for j in T.Parallel(1):
-                    reduce_out[j] += reduce_out[j + 1]
-                tsum_val = reduce_out[0]
+                        tsum_scratch[0] = T.cast(0, T.float32)
+                        for j2 in T.serial(block_N):
+                            s = score_buf[j2]
+                            tsum_scratch[0] += T.if_then_else(
+                                s == -T.infinity(T.float32),
+                                T.cast(0, T.float32),
+                                T.exp(s - new_m_val))
 
-                # ═══ PHASE 6: l_running RMW (thread 0 only) ═══
-
-                for _ in T.Parallel(1):
-                    l_running[0] = l_running[0] * sf_scratch[0] + tsum_val
-
-                # ═══ PHASE 7: Rescale accumulator ═══
-
+                # ═══ PHASE 3: Rescale + l_running RMW (fold into dim parallel) ═══
                 for d in T.Parallel(dim):
                     acc_v_smem[d] *= sf_scratch[0]
+                    if d == 0:
+                        l_running[0] = l_running[0] * sf_scratch[0] + tsum_scratch[0]
 
-                # ═══ PHASE 8: Softmax probs + PV ═══
-
+                # ═══ PHASE 4: Softmax probs ═══
                 for j in T.Parallel(block_N):
-                    reduce_out[j] = T.if_then_else(
+                    score_buf[j] = T.if_then_else(
                         k * block_N + j < sl[bz],
-                        T.exp(raw_score[j] * scale - m_running[0]),
+                        T.exp(score_buf[j] - m_running[0]),
                         T.cast(0, T.float32))
 
                 # ── Load V tile ──
@@ -578,23 +539,13 @@ def _decode_gemv_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                     for i, j in T.Parallel(page_block_size, dim):
                         Vs[i, j] = Vc[ph2, i, kvh, j]
 
-                # ── PV products ──
+                # ═══ PHASE 5: PV products + reduce + accumulate ═══
                 for j, d in T.Parallel(block_N, dim):
-                    product[j, d] = reduce_out[j] * T.cast(Vs[j, d], T.float32)
+                    product[j, d] = score_buf[j] * T.cast(Vs[j, d], T.float32)
 
-                # ── PV tree reduction (16 → 1 per d) ──
-                for j, d in T.Parallel(8, dim):
-                    product[j, d] += product[j + 8, d]
-                for j, d in T.Parallel(4, dim):
-                    product[j, d] += product[j + 4, d]
-                for j, d in T.Parallel(2, dim):
-                    product[j, d] += product[j + 2, d]
-                for j, d in T.Parallel(1, dim):
-                    product[j, d] += product[j + 1, d]
-
-                # ── Accumulate ──
                 for d in T.Parallel(dim):
-                    acc_v_smem[d] += product[0, d]
+                    for j in T.serial(block_N):
+                        acc_v_smem[d] += product[j, d]
 
             # ═══ Output ═══
 
