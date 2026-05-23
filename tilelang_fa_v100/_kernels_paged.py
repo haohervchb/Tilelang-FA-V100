@@ -422,3 +422,172 @@ def get_decode_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
         _DECODE_CACHE[key] = kt
     return _DECODE_CACHE[key]
 
+
+# ── GEMV decode kernel (SIMT FMA, no MMA) ─────────────────────────────────
+
+def _decode_gemv_kernel_func(batch, heads, heads_kv, dim, page_block_size,
+                              max_blocks_per_seq, num_pages,
+                              block_N=16, num_stages=0, threads=256):
+    """SIMT FMA GEMV decode kernel — avoids MMA for single-token decode.
+
+    All computation uses shared memory + T.Parallel + T.serial.
+    Zero fragment usage, zero tensor core usage.
+    Block_M = 1 (no row padding).
+    Reductions done by thread 0 via T.serial loops.
+    """
+    scale = (1.0 / dim) ** 0.5
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor([batch, heads, dim], T.float16),
+        Kc: T.Tensor([num_pages, page_block_size, heads_kv, dim], T.float16),
+        Vc: T.Tensor([num_pages, page_block_size, heads_kv, dim], T.float16),
+        bt: T.Tensor([batch, max_blocks_per_seq], T.int32),
+        sl: T.Tensor([batch], T.int32),
+        Out: T.Tensor([batch, heads, dim], T.float16),
+    ):
+        with T.Kernel(heads, batch, threads=threads) as (bx, bz):
+            Qs = T.alloc_shared([dim], T.float16)
+            Ks = T.alloc_shared([block_N, dim], T.float16)
+            Vs = T.alloc_shared([block_N, dim], T.float16)
+
+            m_shared = T.alloc_shared([1], T.float32)
+            l_shared = T.alloc_shared([1], T.float32)
+            sf_shared = T.alloc_shared([1], T.float32)
+            tsum_shared = T.alloc_shared([1], T.float32)
+            m_cur_shared = T.alloc_shared([1], T.float32)
+
+            temp_smem = T.alloc_shared([block_N, dim], T.float32)
+            scores_smem = T.alloc_shared([block_N], T.float32)
+            acc_v_smem = T.alloc_shared([dim], T.float32)
+            acc_partial_smem = T.alloc_shared([dim], T.float32)
+
+            kvh = bx // (heads // heads_kv)
+
+            T.copy(Q[bz, bx, :], Qs)
+            T.clear(acc_v_smem)
+            T.fill(m_shared, -T.infinity(T.float32))
+            T.fill(l_shared, 0)
+
+            for k in T.Pipelined(T.ceildiv(sl[bz], block_N), num_stages=num_stages):
+                # ── Load K tile (1 page per iteration) ──
+                T.clear(Ks)
+                lp = k
+                if lp < max_blocks_per_seq:
+                    ph = bt[bz, lp]
+                    for i, j in T.Parallel(page_block_size, dim):
+                        Ks[i, j] = Kc[ph, i, kvh, j]
+
+                # ── Q×K^T GEMV: element-wise products into shared memory ──
+                for j, d in T.Parallel(block_N, dim):
+                    temp_smem[j, d] = T.cast(Qs[d], T.float32) * T.cast(Ks[j, d], T.float32)
+
+                # ── Reduce across dim (d) for each token j: thread 0 only ──
+                for tx in T.Parallel(threads):
+                    if tx == 0:
+                        for j in T.serial(block_N):
+                            for d in T.serial(dim):
+                                val = temp_smem[j, d]
+                                scores_smem[j] = T.if_then_else(
+                                    d == 0, val, scores_smem[j] + val)
+
+                # ── Scale + mask ──
+                for j in T.Parallel(block_N):
+                    token_idx = k * block_N + j
+                    scores_smem[j] = T.if_then_else(
+                        token_idx < sl[bz],
+                        scores_smem[j] * scale,
+                        -T.infinity(T.float32))
+
+                # ── Online softmax: all threads redundantly compute max/sf ──
+                # First, thread 0 reduces to shared for score reduction and tsum
+                for tx in T.Parallel(threads):
+                    if tx == 0:
+                        for j in T.serial(block_N):
+                            m_cur_shared[0] = T.if_then_else(
+                                j == 0,
+                                scores_smem[j],
+                                T.max(m_cur_shared[0], scores_smem[j]))
+                        m_cur_shared[0] = T.if_then_else(
+                            m_cur_shared[0] == -T.infinity(T.float32),
+                            T.cast(0, T.float32),
+                            m_cur_shared[0])
+                        old_m = m_shared[0]
+                        new_m = T.max(old_m, m_cur_shared[0])
+                        m_shared[0] = new_m
+                        sf_shared[0] = T.exp(old_m - new_m)
+
+                        for j in T.serial(block_N):
+                            tsum_shared[0] = T.if_then_else(
+                                j == 0,
+                                T.exp(scores_smem[j] - new_m),
+                                tsum_shared[0] + T.exp(scores_smem[j] - new_m))
+
+                        l_shared[0] = l_shared[0] * sf_shared[0] + tsum_shared[0]
+
+                # ── Convert scores to softmax probs (needed for PV) ──
+                for j in T.Parallel(block_N):
+                    scores_smem[j] = T.exp(scores_smem[j] - m_shared[0])
+
+                # ── Rescale accumulator (all threads, use sf from shared) ──
+                for d in T.Parallel(dim):
+                    acc_v_smem[d] *= sf_shared[0]
+
+                # ── Load V tile ──
+                T.clear(Vs)
+                if lp < max_blocks_per_seq:
+                    ph2 = bt[bz, lp]
+                    for i, j in T.Parallel(page_block_size, dim):
+                        Vs[i, j] = Vc[ph2, i, kvh, j]
+
+                # ── P×V GEMV: scores[j] * V[j,d] into shared memory ──
+                for j, d in T.Parallel(block_N, dim):
+                    temp_smem[j, d] = scores_smem[j] * T.cast(Vs[j, d], T.float32)
+
+                # ── Reduce across token dim (j) for each output dim d: thread 0 ──
+                for tx in T.Parallel(threads):
+                    if tx == 0:
+                        for d in T.serial(dim):
+                            for j in T.serial(block_N):
+                                val = temp_smem[j, d]
+                                acc_partial_smem[d] = T.if_then_else(
+                                    j == 0, val, acc_partial_smem[d] + val)
+
+                # ── Accumulate into running output (all threads) ──
+                for d in T.Parallel(dim):
+                    acc_v_smem[d] += acc_partial_smem[d]
+
+            # ── Output (guard against l==0 for empty sequences) ──
+            for d in T.Parallel(dim):
+                Out[bz, bx, d] = T.if_then_else(
+                    l_shared[0] > T.cast(0, T.float32),
+                    T.cast(acc_v_smem[d] / l_shared[0], T.float16),
+                    T.cast(0, T.float16))
+
+    return kernel
+
+
+_GEMV_DECODE_JIT = tilelang.jit(out_idx=[5])(_decode_gemv_kernel_func)
+_GEMV_DECODE_CACHE = {}
+
+_GEMV_DECODE_BEST_CONFIGS = {
+    256: dict(block_N=16, threads=256, num_stages=0),
+}
+
+
+def get_gemv_decode_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
+                            max_blocks):
+    cfg = _GEMV_DECODE_BEST_CONFIGS.get(dim, dict(block_N=16, threads=256, num_stages=0))
+    key = (heads, heads_kv, dim, block_size, cfg["block_N"], cfg["threads"], cfg["num_stages"],
+           batch, max_blocks, num_pages)
+    if key not in _GEMV_DECODE_CACHE:
+        kt = tilelang.jit(out_idx=[5])(_decode_gemv_kernel_func).compile(
+            batch=batch, heads=heads, heads_kv=heads_kv, dim=dim,
+            page_block_size=block_size,
+            max_blocks_per_seq=max_blocks,
+            num_pages=num_pages,
+            **cfg,
+        )
+        _GEMV_DECODE_CACHE[key] = kt
+    return _GEMV_DECODE_CACHE[key]
+
