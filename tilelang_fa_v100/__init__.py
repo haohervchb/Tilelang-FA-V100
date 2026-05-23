@@ -5,6 +5,7 @@ from .interface import (
     tilelang_flash_attn_gpu,
     tilelang_paged_forward,
     tilelang_decode_forward,
+    tilelang_gemv_decode_forward,
 )
 
 __version__ = "1.0.0"
@@ -13,4 +14,5 @@ __all__ = [
     "tilelang_flash_attn_gpu",
     "tilelang_paged_forward",
     "tilelang_decode_forward",
+    "tilelang_gemv_decode_forward",
 ]

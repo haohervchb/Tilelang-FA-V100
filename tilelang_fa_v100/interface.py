@@ -113,3 +113,30 @@ def tilelang_decode_forward(q, k_cache, v_cache, block_table, seq_lens,
         block_size=block_size, num_kv_heads=num_kv_heads,
         softmax_scale=softmax_scale,
     )
+
+
+def tilelang_gemv_decode_forward(q, k_cache, v_cache, block_table, seq_lens,
+                                  block_size=16, num_kv_heads=None,
+                                  softmax_scale=None):
+    """TileLang GEMV paged decode forward (SIMT FMA, no tensor cores).
+
+    Optimized for single-token decode. Uses T.Parallel + serial reduction
+    instead of MMA. Only available for dim=256.
+    """
+    import math
+    from ._kernels_paged import get_gemv_decode_kernel
+
+    batch, num_heads, dim = q.shape
+    heads_kv = num_kv_heads or k_cache.shape[2]
+    num_blocks = k_cache.shape[0]
+    max_blocks = block_table.shape[1]
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(dim)
+
+    kernel = get_gemv_decode_kernel(
+        batch=batch, heads=num_heads, heads_kv=heads_kv, dim=dim,
+        block_size=block_size, num_pages=num_blocks,
+        max_blocks=max_blocks,
+    )
+    return kernel(q, k_cache, v_cache, block_table, seq_lens)
