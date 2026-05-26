@@ -298,6 +298,8 @@ _BEST_CONFIGS = {
     #   With union: Q(32KB) + KV(32KB) + P(2KB) = 66KB fits, enabling 4 warps.
     #   Without union: 99KB exceeds V100 limit.
     #   MMA constraint: block_N=32 → n_warp ≤ 2. With block_M=32, m_warp=2 → 4 warps.
+    #   Alternatives tested: M16N64 (1.4-1.7x slower), M64N16 (fragment layout error).
+    #   Validated as optimal among all valid (m_warp=2,n_warp=2) partitions.
     512: dict(block_M=32, block_N=32, threads=128, num_stages=0, num_splits=1),
 }
 
