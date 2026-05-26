@@ -83,7 +83,8 @@ def tilelang_flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None,
 def tilelang_paged_forward(q, k_cache, v_cache, block_table, seq_lens,
                             query_start_loc, prefix_kv_lens, out=None,
                             block_size=16, num_kv_heads=None,
-                            softmax_scale=None, causal=True):
+                            softmax_scale=None, causal=True,
+                            sliding_window_q=-1, sliding_window_k=-1):
     """Paged FlashAttention forward for vLLM integration.
 
     Args match the reference FA-V100 paged_fwd API.
@@ -93,6 +94,7 @@ def tilelang_paged_forward(q, k_cache, v_cache, block_table, seq_lens,
         query_start_loc, prefix_kv_lens, out=out,
         block_size=block_size, num_kv_heads=num_kv_heads,
         softmax_scale=softmax_scale, causal=causal,
+        sliding_window_q=sliding_window_q, sliding_window_k=sliding_window_k,
     )
 
 

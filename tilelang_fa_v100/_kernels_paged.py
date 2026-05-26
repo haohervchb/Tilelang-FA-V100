@@ -20,10 +20,11 @@ _USE_KV_UNION_FOR_DIM = 256  # use KV union when dim > this value
 def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                        max_blocks_per_seq, num_pages, is_causal,
                        block_M=32, block_N=128, num_stages=0, threads=256,
-                       num_splits=1):
+                       num_splits=1, sliding_window_q=-1, sliding_window_k=-1):
     scale = (1.0 / dim) ** 0.5
     nt = T.dynamic("nt")
     use_kv_union = dim > _USE_KV_UNION_FOR_DIM
+    has_sliding_window = is_causal and (sliding_window_q > 0 or sliding_window_k > 0)
 
     if num_splits > 1:
         # ── Split-KV variant ────────────────────────────────────────────────
@@ -105,14 +106,33 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                                     K_ref[i, j] = K_cache[phys, off, kv_head, j]
 
                             if is_causal:
-                                for i, j in T.Parallel(block_M, block_N):
-                                    q_pos = bx * block_M + i
-                                    kv_pos = split_start + k * block_N + j
-                                    acc_s[i, j] = T.if_then_else(
-                                        kv_pos <= prefix_kv_lens[bz] + q_pos,
-                                        T.if_then_else(kv_pos < cache_seqlens[bz], T.cast(0, T.float32), -T.infinity(T.float32)),
-                                        -T.infinity(T.float32)
-                                    )
+                                if has_sliding_window:
+                                    for i, j in T.Parallel(block_M, block_N):
+                                        q_pos = bx * block_M + i
+                                        kv_pos = split_start + k * block_N + j
+                                        causal_ok = kv_pos <= prefix_kv_lens[bz] + q_pos
+                                        seq_ok = kv_pos < cache_seqlens[bz]
+                                        window_ok_q = T.if_then_else(sliding_window_q > 0,
+                                                                    T.cast(q_pos < kv_pos + sliding_window_q, T.int32),
+                                                                    T.cast(1, T.int32))
+                                        window_ok_k = T.if_then_else(sliding_window_k > 0,
+                                                                    T.cast(kv_pos < q_pos + sliding_window_k, T.int32),
+                                                                    T.cast(1, T.int32))
+                                        window_ok = (window_ok_q > 0) & (window_ok_k > 0)
+                                        acc_s[i, j] = T.if_then_else(
+                                            causal_ok & window_ok & seq_ok,
+                                            T.cast(0, T.float32),
+                                            -T.infinity(T.float32)
+                                        )
+                                else:
+                                    for i, j in T.Parallel(block_M, block_N):
+                                        q_pos = bx * block_M + i
+                                        kv_pos = split_start + k * block_N + j
+                                        acc_s[i, j] = T.if_then_else(
+                                            kv_pos <= prefix_kv_lens[bz] + q_pos,
+                                            T.if_then_else(kv_pos < cache_seqlens[bz], T.cast(0, T.float32), -T.infinity(T.float32)),
+                                            -T.infinity(T.float32)
+                                        )
                             else:
                                 for i, j in T.Parallel(block_M, block_N):
                                     kv_pos = split_start + k * block_N + j
@@ -215,17 +235,36 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                         T.fill(m_i, -T.infinity(T.float32))
                         T.fill(l_i, 0)
 
-                        loop_end = (
-                            T.min(T.ceildiv(cache_seqlens[bz], block_N),
-                                  T.ceildiv(prefix_kv_lens[bz] + bx * block_M + block_M, block_N))
-                            if is_causal
-                            else T.ceildiv(cache_seqlens[bz], block_N)
-                        )
+                        if is_causal and has_sliding_window:
+                            loop_start = T.max(
+                                0,
+                                (bx * block_M - sliding_window_q) // block_N
+                                if sliding_window_q > 0
+                                else 0
+                            )
+                            loop_end_no_window = T.min(
+                                T.ceildiv(cache_seqlens[bz], block_N),
+                                T.ceildiv(prefix_kv_lens[bz] + bx * block_M + block_M, block_N)
+                            )
+                            loop_end = loop_end_no_window
+                            loop_range = T.max(0, loop_end - loop_start)
+                        elif is_causal:
+                            loop_start = 0
+                            loop_end = (
+                                T.min(T.ceildiv(cache_seqlens[bz], block_N),
+                                      T.ceildiv(prefix_kv_lens[bz] + bx * block_M + block_M, block_N))
+                            )
+                            loop_range = loop_end
+                        else:
+                            loop_start = 0
+                            loop_end = T.ceildiv(cache_seqlens[bz], block_N)
+                            loop_range = loop_end
 
-                        for k in T.Pipelined(loop_end, num_stages=num_stages):
+                        for k in T.Pipelined(loop_range, num_stages=num_stages):
+                            actual_k = k + loop_start
                             T.clear(K_ref)
                             for i, j in T.Parallel(block_N, dim):
-                                gkv = k * block_N + i
+                                gkv = actual_k * block_N + i
                                 lp = T.floordiv(gkv, page_block_size)
                                 off = gkv - lp * page_block_size
                                 if lp < max_blocks_per_seq:
@@ -233,18 +272,39 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                                     K_ref[i, j] = K_cache[phys, off, kv_head, j]
 
                             if is_causal:
-                                for i, j in T.Parallel(block_M, block_N):
-                                    q_pos = bx * block_M + i
-                                    kv_pos = k * block_N + j
-                                    causal_ok = kv_pos <= prefix_kv_lens[bz] + q_pos
-                                    seq_ok = kv_pos < cache_seqlens[bz]
-                                    acc_s[i, j] = T.if_then_else(
-                                        causal_ok & seq_ok, 0, -T.infinity(acc_s.dtype)
-                                    )
+                                if has_sliding_window:
+                                    for i, j in T.Parallel(block_M, block_N):
+                                        q_pos = bx * block_M + i
+                                        kv_pos = actual_k * block_N + j
+                                        causal_ok = kv_pos <= prefix_kv_lens[bz] + q_pos
+                                        seq_ok = kv_pos < cache_seqlens[bz]
+                                        window_ok_q = T.cast(1, T.int32)
+                                        window_ok_k = T.cast(1, T.int32)
+                                        window_ok_q = T.if_then_else(sliding_window_q > 0,
+                                                                    T.cast(q_pos < kv_pos + sliding_window_q, T.int32),
+                                                                    T.cast(1, T.int32))
+                                        window_ok_k = T.if_then_else(sliding_window_k > 0,
+                                                                    T.cast(kv_pos < q_pos + sliding_window_k, T.int32),
+                                                                    T.cast(1, T.int32))
+                                        window_ok = (window_ok_q > 0) & (window_ok_k > 0)
+                                        acc_s[i, j] = T.if_then_else(
+                                            causal_ok & window_ok & seq_ok,
+                                            T.cast(0, T.float32),
+                                            -T.infinity(acc_s.dtype)
+                                        )
+                                else:
+                                    for i, j in T.Parallel(block_M, block_N):
+                                        q_pos = bx * block_M + i
+                                        kv_pos = actual_k * block_N + j
+                                        causal_ok = kv_pos <= prefix_kv_lens[bz] + q_pos
+                                        seq_ok = kv_pos < cache_seqlens[bz]
+                                        acc_s[i, j] = T.if_then_else(
+                                            causal_ok & seq_ok, 0, -T.infinity(acc_s.dtype)
+                                        )
                             else:
                                 for i, j in T.Parallel(block_M, block_N):
                                     acc_s[i, j] = T.if_then_else(
-                                        k * block_N + j < cache_seqlens[bz], 0, -T.infinity(acc_s.dtype)
+                                        actual_k * block_N + j < cache_seqlens[bz], 0, -T.infinity(acc_s.dtype)
                                     )
 
                             T.gemm(Q_shared, K_ref, acc_s, transpose_B=True, policy=GemmWarpPolicy.FullRow)
@@ -267,7 +327,7 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
 
                             T.clear(V_ref)
                             for i, j in T.Parallel(block_N, dim):
-                                gkv2 = k * block_N + i
+                                gkv2 = actual_k * block_N + i
                                 lp2 = T.floordiv(gkv2, page_block_size)
                                 off2 = gkv2 - lp2 * page_block_size
                                 if lp2 < max_blocks_per_seq:
@@ -305,12 +365,12 @@ _BEST_CONFIGS = {
 
 
 def get_paged_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
-                     max_blocks, causal):
+                     max_blocks, causal, sliding_window_q=-1, sliding_window_k=-1):
     """Return compiled kernel. Compiles ONCE per (heads, dim, block_size, causal, config)."""
     cfg = _BEST_CONFIGS.get(dim, dict(block_M=32, block_N=128, threads=256, num_stages=0, num_splits=1))
     key = (heads, heads_kv, dim, block_size, causal,
            cfg["block_M"], cfg["block_N"], cfg["threads"], cfg["num_stages"], cfg["num_splits"],
-           batch, max_blocks, num_pages)
+           batch, max_blocks, num_pages, sliding_window_q, sliding_window_k)
     if key not in _KERNEL_CACHE:
         kt = tilelang.jit(out_idx=[9])(_paged_kernel_func).compile(
             batch=batch, heads=heads, heads_kv=heads_kv, dim=dim,
@@ -318,6 +378,8 @@ def get_paged_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
             max_blocks_per_seq=max_blocks,
             num_pages=num_pages,
             is_causal=causal,
+            sliding_window_q=sliding_window_q,
+            sliding_window_k=sliding_window_k,
             **cfg,
         )
         _KERNEL_CACHE[key] = kt
