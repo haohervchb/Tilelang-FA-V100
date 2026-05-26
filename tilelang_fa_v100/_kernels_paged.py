@@ -2,12 +2,19 @@
    4D page-by-page loading handles scattered vLLM page blocks correctly.
    Dynamic tensor shapes via T.dynamic. Compiles ONCE per (heads, dim, causal).
    Supports split-KV for long-sequence parallelism (num_splits > 1).
+
+   HD 512 (dim > 256) uses KV-union optimization where K and V share the same
+   shared memory slot since they have non-overlapping lifetimes in the loop.
+   This saves 32KB+ shared memory, enabling block_M=32, block_N=32, threads=128
+   which doubles warp count from 2 to 4, improving V100 occupancy.
 """
 import math
 import torch
 import tilelang
 import tilelang.language as T
 from tilelang.tileop.base import GemmWarpPolicy
+
+_USE_KV_UNION_FOR_DIM = 256  # use KV union when dim > this value
 
 
 def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
@@ -16,6 +23,7 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                        num_splits=1):
     scale = (1.0 / dim) ** 0.5
     nt = T.dynamic("nt")
+    use_kv_union = dim > _USE_KV_UNION_FOR_DIM
 
     if num_splits > 1:
         # ── Split-KV variant ────────────────────────────────────────────────
@@ -40,8 +48,13 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
             with T.Kernel(num_tiles, heads, batch,
                           threads=threads) as (bx, by, bz):
                 Q_shared = T.alloc_shared([block_M, dim], T.float16)
-                K_shared = T.alloc_shared([block_N, dim], T.float16)
-                V_shared = T.alloc_shared([block_N, dim], T.float16)
+                if use_kv_union:
+                    KV_shared = T.alloc_shared([block_N, dim], T.float16)
+                    K_ref = KV_shared
+                    V_ref = KV_shared
+                else:
+                    K_ref = T.alloc_shared([block_N, dim], T.float16)
+                    V_ref = T.alloc_shared([block_N, dim], T.float16)
                 P_shared = T.alloc_shared([block_M, block_N], T.float16)
 
                 acc_s = T.alloc_fragment([block_M, block_N], T.float32)
@@ -82,14 +95,14 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                         T.fill(l_i, 0)
 
                         for k in T.Pipelined(kv_blocks, num_stages=num_stages):
-                            T.clear(K_shared)
+                            T.clear(K_ref)
                             for i, j in T.Parallel(block_N, dim):
                                 gkv = split_start + k * block_N + i
                                 lp = T.floordiv(gkv, page_block_size)
                                 off = gkv - lp * page_block_size
                                 if lp < max_blocks_per_seq:
                                     phys = block_table[bz, lp]
-                                    K_shared[i, j] = K_cache[phys, off, kv_head, j]
+                                    K_ref[i, j] = K_cache[phys, off, kv_head, j]
 
                             if is_causal:
                                 for i, j in T.Parallel(block_M, block_N):
@@ -107,7 +120,7 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                                         kv_pos < cache_seqlens[bz], 0, -T.infinity(acc_s.dtype)
                                     )
 
-                            T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=GemmWarpPolicy.FullRow)
+                            T.gemm(Q_shared, K_ref, acc_s, transpose_B=True, policy=GemmWarpPolicy.FullRow)
                             T.copy(m_i, m_prev)
                             T.reduce_max(acc_s, m_i, dim=1, clear=False)
                             for i in T.Parallel(block_M):
@@ -125,19 +138,19 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                             for i in T.Parallel(block_M):
                                 l_i[i] += row_sum[i]
 
-                            T.clear(V_shared)
+                            T.clear(V_ref)
                             for i, j in T.Parallel(block_N, dim):
                                 gkv2 = split_start + k * block_N + i
                                 lp2 = T.floordiv(gkv2, page_block_size)
                                 off2 = gkv2 - lp2 * page_block_size
                                 if lp2 < max_blocks_per_seq:
                                     phys2 = block_table[bz, lp2]
-                                    V_shared[i, j] = V_cache[phys2, off2, kv_head, j]
+                                    V_ref[i, j] = V_cache[phys2, off2, kv_head, j]
 
                             for i, j in T.Parallel(block_M, block_N):
                                 P_shared[i, j] = T.cast(acc_s[i, j], T.float16)
                             T.copy(P_shared, acc_s_cast)
-                            T.gemm(acc_s_cast, V_shared, acc_o, policy=GemmWarpPolicy.Square)
+                            T.gemm(acc_s_cast, V_ref, acc_o, policy=GemmWarpPolicy.Square)
 
                         # Merge this split into running state (online softmax across splits)
                         for i in T.Parallel(block_M):
@@ -174,8 +187,13 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
         ):
                 with T.Kernel(T.ceildiv(max_tokens, block_M), heads, batch, threads=threads) as (bx, by, bz):
                     Q_shared = T.alloc_shared([block_M, dim], T.float16)
-                    K_shared = T.alloc_shared([block_N, dim], T.float16)
-                    V_shared = T.alloc_shared([block_N, dim], T.float16)
+                    if use_kv_union:
+                        KV_shared = T.alloc_shared([block_N, dim], T.float16)
+                        K_ref = KV_shared
+                        V_ref = KV_shared
+                    else:
+                        K_ref = T.alloc_shared([block_N, dim], T.float16)
+                        V_ref = T.alloc_shared([block_N, dim], T.float16)
                     P_shared = T.alloc_shared([block_M, block_N], T.float16)
 
                     acc_s = T.alloc_fragment([block_M, block_N], T.float32)
@@ -205,14 +223,14 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                         )
 
                         for k in T.Pipelined(loop_end, num_stages=num_stages):
-                            T.clear(K_shared)
+                            T.clear(K_ref)
                             for i, j in T.Parallel(block_N, dim):
                                 gkv = k * block_N + i
                                 lp = T.floordiv(gkv, page_block_size)
                                 off = gkv - lp * page_block_size
                                 if lp < max_blocks_per_seq:
                                     phys = block_table[bz, lp]
-                                    K_shared[i, j] = K_cache[phys, off, kv_head, j]
+                                    K_ref[i, j] = K_cache[phys, off, kv_head, j]
 
                             if is_causal:
                                 for i, j in T.Parallel(block_M, block_N):
@@ -229,7 +247,7 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                                         k * block_N + j < cache_seqlens[bz], 0, -T.infinity(acc_s.dtype)
                                     )
 
-                            T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=GemmWarpPolicy.FullRow)
+                            T.gemm(Q_shared, K_ref, acc_s, transpose_B=True, policy=GemmWarpPolicy.FullRow)
                             T.copy(m_i, m_prev)
                             T.reduce_max(acc_s, m_i, dim=1, clear=False)
                             for i in T.Parallel(block_M):
@@ -247,19 +265,19 @@ def _paged_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                             for i in T.Parallel(block_M):
                                 l_i[i] += row_sum[i]
 
-                            T.clear(V_shared)
+                            T.clear(V_ref)
                             for i, j in T.Parallel(block_N, dim):
                                 gkv2 = k * block_N + i
                                 lp2 = T.floordiv(gkv2, page_block_size)
                                 off2 = gkv2 - lp2 * page_block_size
                                 if lp2 < max_blocks_per_seq:
                                     phys2 = block_table[bz, lp2]
-                                    V_shared[i, j] = V_cache[phys2, off2, kv_head, j]
+                                    V_ref[i, j] = V_cache[phys2, off2, kv_head, j]
 
                             for i, j in T.Parallel(block_M, block_N):
                                 P_shared[i, j] = T.cast(acc_s[i, j], T.float16)
                             T.copy(P_shared, acc_s_cast)
-                            T.gemm(acc_s_cast, V_shared, acc_o, policy=GemmWarpPolicy.Square)
+                            T.gemm(acc_s_cast, V_ref, acc_o, policy=GemmWarpPolicy.Square)
 
                         for i, j in T.Parallel(block_M, dim):
                             if start_q + i < query_start_loc[bz + 1]:
@@ -276,12 +294,11 @@ _BEST_CONFIGS = {
     64: dict(block_M=32, block_N=128, threads=256, num_stages=0, num_splits=1),
     128: dict(block_M=32, block_N=128, threads=256, num_stages=0, num_splits=1),
     256: dict(block_M=64, block_N=32, threads=256, num_stages=0, num_splits=1),
-    # HD 512 for Gemma4 full_attention layers
-    # V100 SM70 constraints:
-    #   Shared mem: Q(16×512×2=16KB) + K(32×512×2=32KB) + V(32×512×2=32KB) + P(16×32×2=1KB) = 81KB fits
-    #   MMA: block_M=16, block_N=32 → m_warp=1, n_warp=2 → w_rt=16, w_ct1=16, w_ct2=256 ✓
-    #   threads=64 (2 warps) optimal for block_N=32 (max n_warp = 32/16 = 2)
-    512: dict(block_M=16, block_N=32, threads=64, num_stages=0, num_splits=1),
+    # HD 512: Uses KV-union (K+V share shared memory slot) to fit 96KB V100 limit.
+    #   With union: Q(32KB) + KV(32KB) + P(2KB) = 66KB fits, enabling 4 warps.
+    #   Without union: 99KB exceeds V100 limit.
+    #   MMA constraint: block_N=32 → n_warp ≤ 2. With block_M=32, m_warp=2 → 4 warps.
+    512: dict(block_M=32, block_N=32, threads=128, num_stages=0, num_splits=1),
 }
 
 
@@ -315,6 +332,7 @@ def _decode_kernel_func(batch, heads, heads_kv, dim, page_block_size,
     scale = (1.0 / dim) ** 0.5
     pts = block_N // page_block_size
     block_M = 16  # SM70 MMA minimum; row 0 = real Q, rows 1-15 = zero padding
+    use_kv_union = dim > _USE_KV_UNION_FOR_DIM
 
     @T.prim_func
     def kernel(
@@ -327,8 +345,13 @@ def _decode_kernel_func(batch, heads, heads_kv, dim, page_block_size,
     ):
         with T.Kernel(heads, batch, threads=threads) as (bx, bz):
             Qs = T.alloc_shared([block_M, dim], T.float16)
-            Ks = T.alloc_shared([block_N, dim], T.float16)
-            Vs = T.alloc_shared([block_N, dim], T.float16)
+            if use_kv_union:
+                KVs = T.alloc_shared([block_N, dim], T.float16)
+                K_ref = KVs
+                V_ref = KVs
+            else:
+                K_ref = T.alloc_shared([block_N, dim], T.float16)
+                V_ref = T.alloc_shared([block_N, dim], T.float16)
             Ps = T.alloc_shared([block_M, block_N], T.float16)
 
             As = T.alloc_fragment([block_M, block_N], T.float32)
@@ -351,18 +374,18 @@ def _decode_kernel_func(batch, heads, heads_kv, dim, page_block_size,
             T.fill(li, 0)
 
             for k in T.Pipelined(T.ceildiv(sl[bz], block_N), num_stages=num_stages):
-                T.clear(Ks)
+                T.clear(K_ref)
                 for p in T.serial(pts):
                     lp = T.floordiv(k * block_N, page_block_size) + p
                     if lp < max_blocks_per_seq:
                         ph = bt[bz, lp]
                         po = p * page_block_size
                         for i, j in T.Parallel(page_block_size, dim):
-                            Ks[po + i, j] = Kc[ph, i, kvh, j]
+                            K_ref[po + i, j] = Kc[ph, i, kvh, j]
 
                 for i, j in T.Parallel(block_M, block_N):
                     As[i, j] = T.if_then_else(k * block_N + j < sl[bz], T.cast(0, T.float32), -T.infinity(T.float32))
-                T.gemm(Qs, Ks, As, transpose_B=True, policy=GemmWarpPolicy.FullRow)
+                T.gemm(Qs, K_ref, As, transpose_B=True, policy=GemmWarpPolicy.FullRow)
 
                 T.copy(mi, mp)
                 T.reduce_max(As, mi, dim=1, clear=False)
@@ -381,19 +404,19 @@ def _decode_kernel_func(batch, heads, heads_kv, dim, page_block_size,
                 for i in T.Parallel(block_M):
                     li[i] += rs[i]
 
-                T.clear(Vs)
+                T.clear(V_ref)
                 for p in T.serial(pts):
                     lp2 = T.floordiv(k * block_N, page_block_size) + p
                     if lp2 < max_blocks_per_seq:
                         ph2 = bt[bz, lp2]
                         po2 = p * page_block_size
                         for i, j in T.Parallel(page_block_size, dim):
-                            Vs[po2 + i, j] = Vc[ph2, i, kvh, j]
+                            V_ref[po2 + i, j] = Vc[ph2, i, kvh, j]
 
                 for i, j in T.Parallel(block_M, block_N):
                     Ps[i, j] = T.cast(As[i, j], T.float16)
                 T.copy(Ps, Ac)
-                T.gemm(Ac, Vs, Ao, policy=GemmWarpPolicy.Square)
+                T.gemm(Ac, V_ref, Ao, policy=GemmWarpPolicy.Square)
 
             for i, j in T.Parallel(block_M, dim):
                 if i == 0:
@@ -427,4 +450,3 @@ def get_decode_kernel(batch, heads, heads_kv, dim, block_size, num_pages,
         )
         _DECODE_CACHE[key] = kt
     return _DECODE_CACHE[key]
-
