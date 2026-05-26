@@ -276,6 +276,12 @@ _BEST_CONFIGS = {
     64: dict(block_M=32, block_N=128, threads=256, num_stages=0, num_splits=1),
     128: dict(block_M=32, block_N=128, threads=256, num_stages=0, num_splits=1),
     256: dict(block_M=64, block_N=32, threads=256, num_stages=0, num_splits=1),
+    # HD 512 for Gemma4 full_attention layers
+    # V100 SM70 constraints:
+    #   Shared mem: Q(16×512×2=16KB) + K(32×512×2=32KB) + V(32×512×2=32KB) + P(16×32×2=1KB) = 81KB fits
+    #   MMA: block_M=16, block_N=32 → m_warp=1, n_warp=2 → w_rt=16, w_ct1=16, w_ct2=256 ✓
+    #   threads=64 (2 warps) optimal for block_N=32 (max n_warp = 32/16 = 2)
+    512: dict(block_M=16, block_N=32, threads=64, num_stages=0, num_splits=1),
 }
 
 
